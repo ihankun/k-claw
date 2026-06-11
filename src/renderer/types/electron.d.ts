@@ -1,10 +1,42 @@
 import type { OpenClawSessionPatch } from '../../common/openclawSession';
 import type { AppUpdateCheckResult, AppUpdateRuntimeState } from '../../shared/appUpdate/constants';
 import type {
+  AsrRecognizeRequest,
+  AsrRecognizeResult,
+} from '../../shared/asr/constants';
+import type {
   BrowserDiagnosticResult,
   BrowserRuntimeProfile,
 } from '../../shared/browserWebAccess/constants';
-import type { ListLocalWebServicesOptions, LocalWebService } from '../../shared/localWebServices/constants';
+import type {
+  CoworkContextUsageFailureReason,
+  CoworkContextUsageSource,
+} from '../../shared/cowork/constants';
+import type {
+  DataMigrationBackupResult,
+  DataMigrationLastRestoreResponse,
+  DataMigrationRestoreScheduleResult,
+} from '../../shared/dataMigration/constants';
+import type {
+  HtmlShareAccessMode,
+  HtmlShareConfigurableStatus,
+  HtmlShareStatus,
+} from '../../shared/htmlShare/constants';
+import type {
+  InstalledKitRecord,
+  KitReference,
+  KitSkillMetadata,
+  ResolvedKitCapabilities,
+} from '../../shared/kit/constants';
+import type {
+  ListLocalWebServicesOptions,
+  LocalWebService,
+} from '../../shared/localWebServices/constants';
+import type {
+  OpenClawEnginePhase as SharedOpenClawEnginePhase,
+  OpenClawGatewayRepairErrorCode,
+} from '../../shared/openclawEngine/constants';
+import type { ShellOpenFailureReason } from '../../shared/shell/constants';
 interface ApiResponse {
   ok: boolean;
   status: number;
@@ -19,6 +51,12 @@ interface ApiStreamResponse {
   status: number;
   statusText: string;
   error?: string;
+}
+
+interface ShellActionResponse {
+  success: boolean;
+  error?: string;
+  reason?: ShellOpenFailureReason;
 }
 
 // Cowork types for IPC
@@ -38,6 +76,13 @@ interface CoworkSession {
   messages: CoworkMessage[];
   messagesOffset: number;
   totalMessages: number;
+  parentSessionId?: string | null;
+  forkedFromMessageId?: string | null;
+  forkedAt?: number | null;
+  forkMode?: 'none' | 'conversation' | 'worktree';
+  forkWorkspacePath?: string | null;
+  forkGitBranch?: string | null;
+  forkGitBaseRef?: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -57,6 +102,9 @@ interface CoworkSessionSummary {
   pinned: boolean;
   pinOrder?: number | null;
   agentId?: string;
+  parentSessionId?: string | null;
+  forkedAt?: number | null;
+  forkMode?: 'none' | 'conversation' | 'worktree';
   createdAt: number;
   updatedAt: number;
 }
@@ -150,20 +198,26 @@ interface CoworkApiConfig {
   apiType?: 'anthropic' | 'openai';
 }
 
-type OpenClawEnginePhase =
-  | 'not_installed'
-  | 'installing'
-  | 'ready'
-  | 'starting'
-  | 'running'
-  | 'error';
+type OpenClawEnginePhase = SharedOpenClawEnginePhase;
 
 interface OpenClawEngineStatus {
   phase: OpenClawEnginePhase;
   version: string | null;
   progressPercent?: number;
   message?: string;
+  gatewayPort?: number | null;
+  gatewayHttpUrl?: string | null;
   canRetry: boolean;
+}
+
+interface OpenClawGatewayRepairResult {
+  success: boolean;
+  status?: OpenClawEngineStatus;
+  originalPath?: string;
+  backupPath?: string;
+  error?: string;
+  errorCode?: OpenClawGatewayRepairErrorCode;
+  recoverable?: boolean;
 }
 
 interface OpenClawSessionPolicyConfig {
@@ -233,6 +287,25 @@ interface McpServerConfigIPC {
   isBuiltIn: boolean;
   githubUrl?: string;
   registryId?: string;
+  launchResolution?: {
+    serverId: string;
+    resolverKind: 'npx' | 'uvx' | 'python' | 'raw';
+    sourceFingerprint: string;
+    status: 'pending' | 'installing' | 'ready' | 'failed' | 'unsupported';
+    packageName?: string;
+    requestedVersion?: string;
+    resolvedVersion?: string;
+    installDir?: string;
+    command?: string;
+    args?: string[];
+    env?: Record<string, string>;
+    error?: string;
+    installedAt?: number;
+    resolvedAt?: number;
+    lastProbeAt?: number;
+    lastProbeStatus?: string;
+    updatedAt: number;
+  };
   createdAt: number;
   updatedAt: number;
 }
@@ -279,6 +352,24 @@ interface ProfileSummaryData {
   avatarUrl: string | null;
   totalCreditsRemaining: number;
   creditItems: CreditItem[];
+}
+
+interface HtmlShareResult {
+  success: boolean;
+  shareId?: string;
+  url?: string;
+  accessMode?: HtmlShareAccessMode;
+  shareCode?: string;
+  shareCodeUnavailable?: boolean;
+  status?: HtmlShareStatus;
+  moderationStatus?: string;
+  updatedAt?: string;
+  contentUpdatedAt?: string;
+  disabledAt?: string | null;
+  disabledReason?: string | null;
+  error?: string;
+  code?: number;
+  warnings?: string[];
 }
 
 interface IElectronAPI {
@@ -331,6 +422,12 @@ interface IElectronAPI {
       config: Record<string, string>,
     ) => Promise<{ success: boolean; result?: EmailConnectivityTestResult; error?: string }>;
     fetchMarketplace: () => Promise<{ success: boolean; data?: string; error?: string }>;
+    detectFromOpenClaw: () => Promise<{
+      skills: Array<{ name: string; description: string; skillKey: string; baseDir: string }>;
+      error?: string;
+    }>;
+    syncFromOpenClaw: () => Promise<{ synced: string[]; error?: string }>;
+    refreshPluginSkillIds: () => Promise<{ success: boolean; pluginSkillIds?: string[]; error?: string }>;
     onChanged: (callback: () => void) => () => void;
   };
   mcp: {
@@ -349,17 +446,65 @@ interface IElectronAPI {
       id: string;
       enabled: boolean;
     }) => Promise<{ success: boolean; servers?: McpServerConfigIPC[]; error?: string }>;
+    retryLaunchResolution: (
+      id: string,
+    ) => Promise<{ success: boolean; servers?: McpServerConfigIPC[]; error?: string }>;
     fetchMarketplace: () => Promise<{
       success: boolean;
       data?: McpMarketplaceData;
+      error?: string;
+    }>;
+    onChanged: (callback: () => void) => () => void;
+  };
+  kits: {
+    fetchStore: () => Promise<{ success: boolean; data?: string; error?: string }>;
+    install: (params: {
+      kitId: string;
+      bundleUrl: string;
+      version: string;
+      skillListIds: string[];
+      skillList?: KitSkillMetadata[];
+      mcpServers?: unknown[] | null;
+      connectors?: unknown[] | null;
+    }) => Promise<{ success: boolean; skillIds?: string[]; error?: string }>;
+    uninstall: (kitId: string) => Promise<{ success: boolean; error?: string }>;
+    listInstalled: () => Promise<{
+      success: boolean;
+      installed?: Record<string, InstalledKitRecord>;
       error?: string;
     }>;
   };
   agents: {
     list: () => Promise<Agent[]>;
     get: (id: string) => Promise<Agent | null>;
-    create: (request: { id?: string; name: string; description?: string; systemPrompt?: string; identity?: string; model?: string; workingDirectory?: string; icon?: string; skillIds?: string[]; source?: string; presetId?: string }) => Promise<Agent>;
-    update: (id: string, updates: { name?: string; description?: string; systemPrompt?: string; identity?: string; model?: string; workingDirectory?: string; icon?: string; skillIds?: string[]; enabled?: boolean; pinned?: boolean }) => Promise<Agent>;
+    create: (request: {
+      id?: string;
+      name: string;
+      description?: string;
+      systemPrompt?: string;
+      identity?: string;
+      model?: string;
+      workingDirectory?: string;
+      icon?: string;
+      skillIds?: string[];
+      source?: string;
+      presetId?: string;
+    }) => Promise<Agent>;
+    update: (
+      id: string,
+      updates: {
+        name?: string;
+        description?: string;
+        systemPrompt?: string;
+        identity?: string;
+        model?: string;
+        workingDirectory?: string;
+        icon?: string;
+        skillIds?: string[];
+        enabled?: boolean;
+        pinned?: boolean;
+      },
+    ) => Promise<Agent>;
     delete: (id: string) => Promise<boolean>;
     presets: () => Promise<PresetAgent[]>;
     presetTemplates: () => Promise<PresetAgent[]>;
@@ -406,11 +551,18 @@ interface IElectronAPI {
         status?: OpenClawEngineStatus;
         error?: string;
       }>;
+      repairGatewayState: () => Promise<OpenClawGatewayRepairResult>;
       onProgress: (callback: (status: OpenClawEngineStatus) => void) => () => void;
     };
     sessionPolicy: {
-      get: () => Promise<{ success: boolean; config?: OpenClawSessionPolicyConfig; error?: string }>;
-      set: (config: OpenClawSessionPolicyConfig) => Promise<{ success: boolean; config?: OpenClawSessionPolicyConfig; error?: string }>;
+      get: () => Promise<{
+        success: boolean;
+        config?: OpenClawSessionPolicyConfig;
+        error?: string;
+      }>;
+      set: (
+        config: OpenClawSessionPolicyConfig,
+      ) => Promise<{ success: boolean; config?: OpenClawSessionPolicyConfig; error?: string }>;
     };
     session: {
       patch: (options: {
@@ -423,6 +575,11 @@ interface IElectronAPI {
       listProfiles: () => Promise<{ success: boolean; profiles?: unknown[]; error?: string }>;
       test: (options?: { profile?: BrowserRuntimeProfile }) => Promise<BrowserDiagnosticResult>;
       resetProfile: (options?: { profile?: BrowserRuntimeProfile }) => Promise<{ success: boolean; result?: Record<string, unknown>; error?: string }>;
+    };
+    dataMigration: {
+      backup: () => Promise<DataMigrationBackupResult>;
+      restore: () => Promise<DataMigrationRestoreScheduleResult>;
+      getLastRestoreResult: () => Promise<DataMigrationLastRestoreResponse>;
     };
   };
   ipcRenderer: {
@@ -444,8 +601,15 @@ interface IElectronAPI {
       systemPrompt?: string;
       title?: string;
       activeSkillIds?: string[];
+      runtimeSkillIds?: string[];
+      kitIds?: string[];
+      kitReferences?: KitReference[];
+      resolvedKitCapabilities?: ResolvedKitCapabilities;
+      selectedTextSnippets?: Array<{ id: string; text: string; sourceMessageId?: string; sourceMessageType?: 'assistant' | 'artifact_markdown' | 'artifact_text'; sourceId?: string; sourceType?: 'assistant' | 'artifact_markdown' | 'artifact_text'; sourceTitle?: string; sourcePath?: string; artifactId?: string; createdAt: number; startOffset?: number; endOffset?: number }>;
       agentId?: string;
-      imageAttachments?: Array<{ name: string; mimeType: string; base64Data: string }>;
+      imageAttachments?: Array<{ name: string; mimeType: string; base64Data: string; sizeBytes?: number; localPath?: string; previewMimeType?: string; previewBase64Data?: string }>;
+      mediaSelection?: { mode: string; modelId?: string; modelName?: string; imageModelId?: string; videoModelId?: string };
+      mediaReferences?: Array<{ token: string; mediaType: string; index: number; fileId: string; fileName: string; mimeType: string; localPath?: string; remoteUrl?: string; dataUrl?: string; role?: string }>;
     }) => Promise<{
       success: boolean;
       session?: CoworkSession;
@@ -458,7 +622,14 @@ interface IElectronAPI {
       prompt: string;
       systemPrompt?: string;
       activeSkillIds?: string[];
-      imageAttachments?: Array<{ name: string; mimeType: string; base64Data: string }>;
+      runtimeSkillIds?: string[];
+      kitIds?: string[];
+      kitReferences?: KitReference[];
+      resolvedKitCapabilities?: ResolvedKitCapabilities;
+      selectedTextSnippets?: Array<{ id: string; text: string; sourceMessageId?: string; sourceMessageType?: 'assistant' | 'artifact_markdown' | 'artifact_text'; sourceId?: string; sourceType?: 'assistant' | 'artifact_markdown' | 'artifact_text'; sourceTitle?: string; sourcePath?: string; artifactId?: string; createdAt: number; startOffset?: number; endOffset?: number }>;
+      imageAttachments?: Array<{ name: string; mimeType: string; base64Data: string; sizeBytes?: number; localPath?: string; previewMimeType?: string; previewBase64Data?: string }>;
+      mediaSelection?: { mode: string; modelId?: string; modelName?: string; imageModelId?: string; videoModelId?: string };
+      mediaReferences?: Array<{ token: string; mediaType: string; index: number; fileId: string; fileName: string; mimeType: string; localPath?: string; remoteUrl?: string; dataUrl?: string; role?: string }>;
     }) => Promise<{
       success: boolean;
       session?: CoworkSession;
@@ -477,9 +648,17 @@ interface IElectronAPI {
       sessionId: string;
       title: string;
     }) => Promise<{ success: boolean; error?: string }>;
+    forkSession: (options: {
+      sessionId: string;
+      forkedFromMessageId?: string | null;
+      title?: string;
+    }) => Promise<{ success: boolean; session?: CoworkSession; error?: string }>;
     getSession: (
       sessionId: string,
     ) => Promise<{ success: boolean; session?: CoworkSession; error?: string }>;
+    markSessionViewed: (
+      sessionId: string,
+    ) => Promise<{ success: boolean; error?: string }>;
     remoteManaged: (
       sessionId: string,
     ) => Promise<{ success: boolean; remoteManaged: boolean; error?: string }>;
@@ -491,10 +670,22 @@ interface IElectronAPI {
     }>;
     getContextUsage: (
       sessionId: string,
-    ) => Promise<{ success: boolean; usage?: CoworkContextUsage | null; error?: string }>;
+    ) => Promise<{
+      success: boolean;
+      usage?: CoworkContextUsage | null;
+      source?: CoworkContextUsageSource;
+      reason?: CoworkContextUsageFailureReason;
+      error?: string;
+    }>;
     compactContext: (
       sessionId: string,
-    ) => Promise<{ success: boolean; compacted?: boolean; reason?: string; usage?: CoworkContextUsage | null; error?: string }>;
+    ) => Promise<{
+      success: boolean;
+      compacted?: boolean;
+      reason?: string;
+      usage?: CoworkContextUsage | null;
+      error?: string;
+    }>;
     getSessionMessages: (options: {
       sessionId: string;
       limit?: number;
@@ -528,6 +719,7 @@ interface IElectronAPI {
       defaultFileName?: string;
       fileExtension?: string;
     }) => Promise<{ success: boolean; canceled?: boolean; path?: string; error?: string }>;
+    cancelMediaTask: (taskId: string) => Promise<{ success: boolean; message?: string }>;
     getSubTaskHistory: (options: {
       parentSessionId: string;
       agentId: string;
@@ -563,12 +755,20 @@ interface IElectronAPI {
       }>;
       error?: string;
     }>;
+    deleteSubagentSession: (options: {
+      parentSessionId: string;
+      runId: string;
+    }) => Promise<{ success: boolean; deleted?: boolean; error?: string }>;
     respondToPermission: (options: {
       requestId: string;
       result: CoworkPermissionResult;
     }) => Promise<{ success: boolean; error?: string }>;
     getConfig: () => Promise<{ success: boolean; config?: CoworkConfig; error?: string }>;
     setConfig: (config: CoworkConfigUpdate) => Promise<{ success: boolean; error?: string }>;
+    notifyOpenSessionFromNotificationReady: () => Promise<{ success: boolean; error?: string }>;
+    onOpenSessionFromNotification: (
+      callback: (data: { sessionId: string }) => void,
+    ) => () => void;
     listMemoryEntries: (input: {
       query?: string;
       limit?: number;
@@ -594,7 +794,15 @@ interface IElectronAPI {
       callback: (data: { sessionId: string; message: CoworkMessage; beforeMessageId?: string }) => void,
     ) => () => void;
     onStreamMessageUpdate: (
-      callback: (data: { sessionId: string; messageId: string; content: string; metadata?: Record<string, unknown> }) => void,
+      callback: (data: {
+        sessionId: string;
+        messageId: string;
+        content: string;
+        metadata?: Record<string, unknown>;
+      }) => void,
+    ) => () => void;
+    onMediaStatusPollUpdate?: (
+      callback: (data: { sessionId: string; toolCallId: string; details: Record<string, unknown> }) => void,
     ) => () => void;
     onStreamSessionStatus: (
       callback: (data: { sessionId: string; status: CoworkSessionStatus }) => void,
@@ -617,36 +825,105 @@ interface IElectronAPI {
   };
   dialog: {
     selectDirectory: () => Promise<{ success: boolean; path: string | null }>;
-    selectFile: (options?: { title?: string; filters?: { name: string; extensions: string[] }[] }) => Promise<{ success: boolean; path: string | null }>;
-    selectFiles: (options?: { title?: string; filters?: { name: string; extensions: string[] }[] }) => Promise<{ success: boolean; paths: string[] }>;
-    saveInlineFile: (options: { dataBase64: string; fileName?: string; mimeType?: string; cwd?: string }) => Promise<{ success: boolean; path: string | null; error?: string }>;
-    readFileAsDataUrl: (filePath: string) => Promise<{ success: boolean; dataUrl?: string; error?: string }>;
-    statFile: (filePath: string) => Promise<{ success: boolean; isFile?: boolean; size?: number; mtimeMs?: number; error?: string }>;
-    readTextFile: (filePath: string) => Promise<{ success: boolean; content?: string; size?: number; readBytes?: number; truncated?: boolean; error?: string }>;
-    generateThumbnail: (filePath: string) => Promise<{ success: boolean; dataUrl?: string; error?: string }>;
-    showMessageBox: (options: { message: string; type?: 'none' | 'info' | 'error' | 'question' | 'warning'; title?: string }) => Promise<{ response: number }>;
+    selectFile: (options?: {
+      title?: string;
+      filters?: { name: string; extensions: string[] }[];
+    }) => Promise<{ success: boolean; path: string | null }>;
+    selectFiles: (options?: {
+      title?: string;
+      filters?: { name: string; extensions: string[] }[];
+    }) => Promise<{ success: boolean; paths: string[] }>;
+    saveInlineFile: (options: {
+      dataBase64: string;
+      fileName?: string;
+      mimeType?: string;
+      cwd?: string;
+    }) => Promise<{ success: boolean; path: string | null; error?: string }>;
+    readFileAsDataUrl: (
+      filePath: string,
+    ) => Promise<{ success: boolean; dataUrl?: string; error?: string }>;
+    statFile: (
+      filePath: string,
+    ) => Promise<{ success: boolean; isFile?: boolean; size?: number; mtimeMs?: number; error?: string }>;
+    readTextFile: (
+      filePath: string,
+    ) => Promise<{
+      success: boolean;
+      content?: string;
+      size?: number;
+      readBytes?: number;
+      truncated?: boolean;
+      error?: string;
+    }>;
+    generateThumbnail: (
+      filePath: string,
+    ) => Promise<{ success: boolean; dataUrl?: string; error?: string }>;
+    showMessageBox: (options: {
+      message: string;
+      type?: 'none' | 'info' | 'error' | 'question' | 'warning';
+      title?: string;
+    }) => Promise<{ response: number }>;
   };
   shell: {
-    openPath: (filePath: string) => Promise<{ success: boolean; error?: string }>;
-    showItemInFolder: (filePath: string) => Promise<{ success: boolean; error?: string }>;
+    openPath: (filePath: string) => Promise<ShellActionResponse>;
+    showItemInFolder: (filePath: string) => Promise<ShellActionResponse>;
     openExternal: (url: string) => Promise<{ success: boolean; error?: string }>;
     openHtmlInBrowser: (htmlContent: string) => Promise<{ success: boolean; error?: string }>;
-    getAppsForFile: (filePath: string) => Promise<{ success: boolean; apps: Array<{ name: string; path: string; isDefault: boolean; icon?: string }>; error?: string }>;
-    openPathWithApp: (filePath: string, appPath: string) => Promise<{ success: boolean; error?: string }>;
+    getAppsForFile: (
+      filePath: string,
+    ) => Promise<{
+      success: boolean;
+      apps: Array<{ name: string; path: string; isDefault: boolean; icon?: string }>;
+      error?: string;
+    }>;
+    openPathWithApp: (
+      filePath: string,
+      appPath: string,
+    ) => Promise<ShellActionResponse>;
   };
   clipboard: {
+    writeText: (text: string) => Promise<{ success: boolean; error?: string }>;
     writeImageFromFile: (filePath: string) => Promise<{ success: boolean; error?: string }>;
     writeImageFromDataUrl: (dataUrl: string) => Promise<{ success: boolean; error?: string }>;
   };
-  voice: {
-    triggerDictation: () => Promise<{ success: boolean; error?: string }>;
+  htmlShare: {
+    createFromHtmlFile: (options: {
+      sessionId: string;
+      artifactId: string;
+      filePath: string;
+      title: string;
+    }) => Promise<HtmlShareResult>;
+    updateFromHtmlFile: (options: {
+      shareId: string;
+      sessionId: string;
+      artifactId: string;
+      filePath: string;
+      title: string;
+      currentStatus?: HtmlShareStatus;
+    }) => Promise<HtmlShareResult>;
+    getByHtmlFile: (options: {
+      filePath: string;
+    }) => Promise<{ success: boolean; share?: HtmlShareResult | null; error?: string; code?: number }>;
+    updateStatus: (options: {
+      shareId: string;
+      status: HtmlShareConfigurableStatus;
+    }) => Promise<HtmlShareResult>;
+    disable: (shareId: string) => Promise<HtmlShareResult>;
+    get: (shareId: string) => Promise<{ success: boolean; share?: unknown; error?: string }>;
+  };
+  asr: {
+    recognize: (options: AsrRecognizeRequest) => Promise<AsrRecognizeResult>;
   };
   artifact: {
     watchFile: (filePath: string) => Promise<void>;
     unwatchFile: (filePath: string) => Promise<void>;
     onFileChanged: (callback: (data: { filePath: string }) => void) => () => void;
-    createPreviewSession: (filePath: string) => Promise<{ success: boolean; sessionId?: string; url?: string; error?: string }>;
-    createOfficePreviewSession: (filePath: string) => Promise<{ success: boolean; sessionId?: string; url?: string; error?: string }>;
+    createPreviewSession: (
+      filePath: string,
+    ) => Promise<{ success: boolean; sessionId?: string; url?: string; error?: string }>;
+    createOfficePreviewSession: (
+      filePath: string,
+    ) => Promise<{ success: boolean; sessionId?: string; url?: string; error?: string }>;
     destroyPreviewSession: (sessionId: string) => Promise<{ success: boolean }>;
     clearBrowserCookies: () => Promise<{ success: boolean; error?: string }>;
     clearBrowserCache: () => Promise<{ success: boolean; error?: string }>;
@@ -667,7 +944,10 @@ interface IElectronAPI {
   };
   appUpdate: {
     getState: () => Promise<AppUpdateRuntimeState>;
-    checkNow: (options?: { manual?: boolean; userId?: string | null }) => Promise<AppUpdateCheckResult>;
+    checkNow: (options?: {
+      manual?: boolean;
+      userId?: string | null;
+    }) => Promise<AppUpdateCheckResult>;
     retryDownload: () => Promise<{ success: boolean; state: AppUpdateRuntimeState }>;
     cancelDownload: () => Promise<{ success: boolean; state: AppUpdateRuntimeState }>;
     installReady: () => Promise<{ success: boolean; state: AppUpdateRuntimeState; error?: string }>;
@@ -692,7 +972,7 @@ interface IElectronAPI {
         pluginId: string;
         version?: string;
         description?: string;
-        source: 'npm' | 'clawhub' | 'git' | 'local' | 'bundled';
+        source: 'npm' | 'clawhub' | 'git' | 'local' | 'bundled' | 'openclaw';
         enabled: boolean;
         canUninstall: boolean;
         hasConfig: boolean;
@@ -711,19 +991,43 @@ interface IElectronAPI {
       success: boolean;
       schema?: {
         configSchema: Record<string, unknown>;
-        uiHints: Record<string, {
-          label?: string;
-          help?: string;
-          sensitive?: boolean;
-          advanced?: boolean;
-          placeholder?: string;
-          order?: number;
-        }>;
+        uiHints: Record<
+          string,
+          {
+            label?: string;
+            help?: string;
+            sensitive?: boolean;
+            advanced?: boolean;
+            placeholder?: string;
+            order?: number;
+          }
+        >;
       } | null;
       config?: Record<string, unknown> | null;
       error?: string;
     }>;
-    saveConfig: (pluginId: string, config: Record<string, unknown>) => Promise<{ ok: boolean; error?: string }>;
+    saveConfig: (
+      pluginId: string,
+      config: Record<string, unknown>,
+    ) => Promise<{ ok: boolean; error?: string }>;
+    batchSave: (changes: {
+      toggles?: Array<{ pluginId: string; enabled: boolean }>;
+      configs?: Array<{ pluginId: string; config: Record<string, unknown> }>;
+    }) => Promise<{ ok: boolean; error?: string }>;
+    detect: () => Promise<{ plugins: string[]; error?: string }>;
+    sync: () => Promise<{ synced: string[]; error?: string }>;
+    checkUpdates: (pluginIds?: string[]) => Promise<{
+      success: boolean;
+      updates?: Array<{
+        pluginId: string;
+        currentVersion: string | null;
+        latestVersion: string | null;
+        hasUpdate: boolean;
+        error?: string;
+      }>;
+      error?: string;
+    }>;
+    update: (pluginId: string) => Promise<{ ok: boolean; version?: string; error?: string }>;
     onInstallLog: (callback: (line: string) => void) => () => void;
   };
   im: {
@@ -755,9 +1059,7 @@ interface IElectronAPI {
       message: string;
       sessionKey?: string;
     }>;
-    weixinQrLoginWait: (
-      sessionKey?: string,
-    ) => Promise<{
+    weixinQrLoginWait: (sessionKey?: string) => Promise<{
       success: boolean;
       connected: boolean;
       message: string;
@@ -782,9 +1084,19 @@ interface IElectronAPI {
     }>;
 
     // POPO Multi-Instance
-    addPopoInstance: (name: string) => Promise<{ success: boolean; instance?: import('./im').PopoInstanceConfig; error?: string }>;
+    addPopoInstance: (
+      name: string,
+    ) => Promise<{
+      success: boolean;
+      instance?: import('./im').PopoInstanceConfig;
+      error?: string;
+    }>;
     deletePopoInstance: (instanceId: string) => Promise<{ success: boolean; error?: string }>;
-    setPopoInstanceConfig: (instanceId: string, config: Record<string, unknown>, options?: { syncGateway?: boolean; restartGatewayIfRunning?: boolean; markRestartOnSave?: boolean }) => Promise<{ success: boolean; error?: string }>;
+    setPopoInstanceConfig: (
+      instanceId: string,
+      config: Record<string, unknown>,
+      options?: { syncGateway?: boolean; restartGatewayIfRunning?: boolean; markRestartOnSave?: boolean },
+    ) => Promise<{ success: boolean; error?: string }>;
 
     listPairingRequests: (platform: string) => Promise<{
       success: boolean;
@@ -1010,9 +1322,29 @@ interface IElectronAPI {
       success: boolean;
       models?: Array<{ modelId: string; modelName: string; provider: string; apiFormat: string }>;
     }>;
+    getPricingCatalog: () => Promise<{
+      success: boolean;
+      textModels?: Array<{
+        modelId: string;
+        modelName: string;
+        provider?: string;
+        providerLabel?: string;
+        description?: string;
+        supportsImage?: boolean;
+        supportsThinking?: boolean;
+        contextWindow?: number | null;
+        costMultiplier?: number;
+      }>;
+      error?: string;
+    }>;
     getProfileSummary: () => Promise<{ success: boolean; data?: ProfileSummaryData }>;
+    getPendingCallback: () => Promise<string | null>;
     onCallback: (callback: (data: { code: string }) => void) => () => void;
     onQuotaChanged: (callback: () => void) => () => void;
+  };
+  media: {
+    getModels: (type: 'image' | 'video') => Promise<{ success: boolean; models?: Array<{ modelId: string; displayName: string; provider: string; mediaType: string; generationTimeout: number; pricing: Record<string, unknown> }>; error?: string }>;
+    getTaskStatus: (taskId: number, type: 'image' | 'video') => Promise<{ success: boolean; task?: Record<string, unknown>; error?: string }>;
   };
   enterprise: {
     getConfig: () => Promise<{
@@ -1027,9 +1359,7 @@ interface IElectronAPI {
   };
   auth: {
     login: (loginUrl?: string) => Promise<{ success: boolean; error?: string }>;
-    exchange: (
-      code: string,
-    ) => Promise<{
+    exchange: (code: string) => Promise<{
       success: boolean;
       user?: import('../store/slices/authSlice').UserProfile;
       quota?: {
@@ -1065,6 +1395,7 @@ interface IElectronAPI {
     logout: () => Promise<{ success: boolean }>;
     refreshToken: () => Promise<{ success: boolean; accessToken?: string }>;
     getAccessToken: () => Promise<string | null>;
+    getPendingCallback: () => Promise<string | null>;
     onCallback: (callback: (data: { code: string }) => void) => () => void;
   };
   qwen: Record<string, never>;
@@ -1106,7 +1437,10 @@ interface IElectronAPI {
         clientSecret?: string;
         error?: string;
       }>;
-      verify: (clientId: string, clientSecret: string) => Promise<{
+      verify: (
+        clientId: string,
+        clientSecret: string,
+      ) => Promise<{
         success: boolean;
         error?: string;
       }>;

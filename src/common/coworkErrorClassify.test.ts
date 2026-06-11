@@ -1,4 +1,5 @@
-import { test, expect } from 'vitest';
+import { expect,test } from 'vitest';
+
 import { classifyErrorKey } from './coworkErrorClassify';
 
 const classifyError = (error: string) => classifyErrorKey(error) ?? error;
@@ -41,6 +42,10 @@ test('billing: DeepSeek insufficient_balance', () => {
 
 test('billing: OpenAI insufficient_quota', () => {
   expect(classifyError('You exceeded your current quota, please check your plan and billing details. insufficient_quota')).toBe('coworkErrorInsufficientBalance');
+});
+
+test('billing: LobsterAI free quota exhausted', () => {
+  expect(classifyError('免费额度已用完，请升级套餐')).toBe('coworkErrorFreeQuotaExhausted');
 });
 
 test('billing: OpenRouter insufficient credits', () => {
@@ -107,12 +112,32 @@ test('model: Ollama model xxx not found', () => {
 
 // ==================== Gateway / connection ====================
 
+test('gateway: chat send payload too large', () => {
+  expect(classifyError('chat.send payload too large: estimated 38128542 bytes exceeds safe limit 30932992 bytes')).toBe('coworkErrorMessageTooLarge');
+});
+
+test('gateway: max payload exceeded', () => {
+  expect(classifyError('[ws] error conn=abc remote=127.0.0.1: Max payload size exceeded')).toBe('coworkErrorMessageTooLarge');
+});
+
+test('gateway: websocket 1009 close', () => {
+  expect(classifyError('gateway closed (1009):')).toBe('coworkErrorMessageTooLarge');
+});
+
+test('gateway: message too big', () => {
+  expect(classifyError('WebSocket message too big')).toBe('coworkErrorMessageTooLarge');
+});
+
 test('gateway: disconnect', () => {
   expect(classifyError('gateway disconnected unexpectedly')).toBe('coworkErrorGatewayDisconnected');
 });
 
 test('gateway: client disconnected', () => {
   expect(classifyError('client disconnected')).toBe('coworkErrorGatewayDisconnected');
+});
+
+test('gateway: session patch timeout before send', () => {
+  expect(classifyError('gateway request timeout for sessions.patch')).toBe('coworkGatewaySessionSyncTimeout');
 });
 
 test('gateway: service restart', () => {

@@ -81,27 +81,29 @@ export function setServerBaseUrlGetter(getter: () => string): void {
 }
 
 // Cached server model metadata (populated when auth:getModels is called)
-// Keyed by modelId → { supportsImage, contextWindow }
-let serverModelMetadataCache: Map<string, { supportsImage?: boolean; contextWindow?: number }> = new Map();
+// Keyed by modelId → { supportsImage, supportsThinking, contextWindow }
+let serverModelMetadataCache: Map<string, { supportsImage?: boolean; supportsThinking?: boolean; contextWindow?: number }> = new Map();
 
 const serializeServerModelMetadata = (
-  models: Array<{ modelId: string; supportsImage?: boolean; contextWindow?: number }>,
+  models: Array<{ modelId: string; supportsImage?: boolean; supportsThinking?: boolean; contextWindow?: number }>,
 ): string => JSON.stringify(
   models
     .map((model) => ({
       modelId: model.modelId,
       supportsImage: model.supportsImage,
+      supportsThinking: model.supportsThinking,
       contextWindow: model.contextWindow,
     }))
     .sort((a, b) => a.modelId.localeCompare(b.modelId)),
 );
 
-export function updateServerModelMetadata(models: Array<{ modelId: string; supportsImage?: boolean; contextWindow?: number }>): boolean {
+export function updateServerModelMetadata(models: Array<{ modelId: string; supportsImage?: boolean; supportsThinking?: boolean; contextWindow?: number }>): boolean {
   const previous = serializeServerModelMetadata(getAllServerModelMetadata());
-  const nextCache = new Map(models.map(m => [m.modelId, { supportsImage: m.supportsImage, contextWindow: m.contextWindow }]));
+  const nextCache = new Map(models.map(m => [m.modelId, { supportsImage: m.supportsImage, supportsThinking: m.supportsThinking, contextWindow: m.contextWindow }]));
   const next = serializeServerModelMetadata(Array.from(nextCache.entries()).map(([modelId, meta]) => ({
     modelId,
     supportsImage: meta.supportsImage,
+    supportsThinking: meta.supportsThinking,
     contextWindow: meta.contextWindow,
   })));
   serverModelMetadataCache = nextCache;
@@ -112,10 +114,11 @@ export function clearServerModelMetadata(): void {
   serverModelMetadataCache.clear();
 }
 
-export function getAllServerModelMetadata(): Array<{ modelId: string; supportsImage?: boolean; contextWindow?: number }> {
+export function getAllServerModelMetadata(): Array<{ modelId: string; supportsImage?: boolean; supportsThinking?: boolean; contextWindow?: number }> {
   return Array.from(serverModelMetadataCache.entries()).map(([modelId, meta]) => ({
     modelId,
     supportsImage: meta.supportsImage,
+    supportsThinking: meta.supportsThinking,
     contextWindow: meta.contextWindow,
   }));
 }
@@ -142,15 +145,23 @@ function buildServerFallbackModels(effectiveModelId: string): NonNullable<LocalP
 function normalizeProviderModels(providerName: string, models?: ProviderModelInputConfig[]): ProviderModelConfig[] {
   return (models ?? [])
     .filter(model => model.id?.trim())
-    .map(model => ({
-      ...model,
-      name: model.name || model.id,
-      supportsImage: ProviderRegistry.resolveModelSupportsImage(
+    .map(model => {
+      const contextWindow = ProviderRegistry.resolveModelContextWindow(
         providerName,
         model.id,
-        model.supportsImage,
-      ),
-    }));
+        model.contextWindow,
+      );
+      return {
+        ...model,
+        name: model.name || model.id,
+        supportsImage: ProviderRegistry.resolveModelSupportsImage(
+          providerName,
+          model.id,
+          model.supportsImage,
+        ),
+        ...(contextWindow !== undefined ? { contextWindow } : {}),
+      };
+    });
 }
 
 const getStore = (): SqliteStore | null => {
@@ -182,7 +193,9 @@ function getEffectiveProviderApiFormat(providerName: string, apiFormat: unknown)
 }
 
 function providerRequiresApiKey(providerName: string): boolean {
-  return providerName !== ProviderName.Ollama && providerName !== ProviderName.LmStudio;
+  return providerName !== ProviderName.Ollama
+    && providerName !== ProviderName.LmStudio
+    && providerName !== ProviderName.Copilot;
 }
 
 function shouldUseOpenAICodexOAuth(providerName: string, providerConfig: LocalProviderConfig): boolean {
@@ -206,7 +219,7 @@ function tryLobsteraiServerFallback(modelId?: string): MatchedProvider | null {
   if (!effectiveModelId) return null;
   const baseURL = `${serverBaseUrl}/api/proxy/v1`;
   const cachedMeta = serverModelMetadataCache.get(effectiveModelId);
-  console.log('[ClaudeSettings] lobsterai-server fallback activated:', { baseURL, modelId: effectiveModelId, supportsImage: cachedMeta?.supportsImage });
+  console.debug('[ClaudeSettings] lobsterai-server provider resolved:', { baseURL, modelId: effectiveModelId, supportsImage: cachedMeta?.supportsImage });
   return {
     providerName: ProviderName.LobsteraiServer,
     providerConfig: { enabled: true, apiKey: tokens.accessToken, baseUrl: baseURL, apiFormat: 'openai', models: buildServerFallbackModels(effectiveModelId) },

@@ -1,4 +1,4 @@
-import { ChatBubbleLeftIcon, CpuChipIcon, CubeIcon, EnvelopeIcon, GlobeAltIcon, InformationCircleIcon, SunIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { ArchiveBoxIcon, ArrowPathIcon, ArrowPathRoundedSquareIcon, ChatBubbleLeftIcon, CheckCircleIcon, CpuChipIcon, CubeIcon, EnvelopeIcon, ExclamationTriangleIcon, GlobeAltIcon, InformationCircleIcon, MagnifyingGlassIcon, SunIcon, TrashIcon, WrenchScrewdriverIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import React, { useCallback,useEffect, useMemo, useRef, useState } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 
@@ -8,8 +8,11 @@ import {
   defaultBrowserWebAccessConfig,
   normalizeBrowserWebAccessConfig,
 } from '../../shared/browserWebAccess/constants';
-import { ProviderRegistry, resolveCodingPlanBaseUrl } from '../../shared/providers';
-import { type AppConfig, defaultConfig, getProviderDisplayName, getVisibleProviders } from '../config';
+import { DataMigrationRestoreStatus } from '../../shared/dataMigration/constants';
+import { normalizeNotificationSettings } from '../../shared/notifications/constants';
+import { OpenClawEnginePhase, OpenClawGatewayRepairErrorCode } from '../../shared/openclawEngine/constants';
+import { ProviderAuthType, ProviderName, ProviderRegistry, resolveCodingPlanBaseUrl } from '../../shared/providers';
+import { type AppConfig, defaultConfig, getProviderDisplayName, getVisibleProviders, ShortcutAction, type ShortcutConfig } from '../config';
 import { APP_ID, EXPORT_FORMAT_TYPE, EXPORT_PASSWORD } from '../constants/app';
 import { apiService } from '../services/api';
 import { configService } from '../services/config';
@@ -17,6 +20,7 @@ import { coworkService } from '../services/cowork';
 import { decryptSecret, decryptWithPassword, EncryptedPayload, encryptWithPassword, PasswordEncryptedPayload } from '../services/encryption';
 import { i18nService, LanguageType } from '../services/i18n';
 import { imService } from '../services/im';
+import { formatShortcutForDisplay, getShortcutConflictSignature, matchesShortcut } from '../services/shortcuts';
 import { themeService } from '../services/theme';
 import type { RootState } from '../store';
 import { selectCoworkConfig } from '../store/selectors/coworkSelectors';
@@ -26,6 +30,7 @@ import type {
   CoworkMemoryStats,
   CoworkUserMemoryEntry,
   OpenClawEngineStatus,
+  OpenClawGatewayRepairResult,
   OpenClawSessionKeepAlive,
 } from '../types/cowork';
 import { OpenClawSessionKeepAlive as OpenClawSessionKeepAliveValues } from '../types/cowork';
@@ -34,10 +39,12 @@ import DreamingSettingsSection from './cowork/DreamingSettingsSection';
 import EmbeddingSettingsSection from './cowork/EmbeddingSettingsSection';
 import ErrorMessage from './ErrorMessage';
 import BrainIcon from './icons/BrainIcon';
+import EditIcon from './icons/EditIcon';
+import MessageCopyIcon from './icons/MessageCopyIcon';
 import PlugIcon from './icons/PlugIcon';
 import PlusCircleIcon from './icons/PlusCircleIcon';
 import IMSettings from './im/IMSettings';
-import PluginsSettings from './plugins/PluginsSettings';
+import PluginsSettings, { type PluginsSettingsHandle } from './plugins/PluginsSettings';
 import BrowserWebAccessSettings from './settings/BrowserWebAccessSettings';
 import {
   buildOpenAICompatibleChatCompletionsUrl,
@@ -67,6 +74,184 @@ import EmailSkillConfig from './skills/EmailSkillConfig';
 import ThemedSelect from './ui/ThemedSelect';
 
 type TabType = 'general' | 'appearance' | 'coworkAgentEngine' | 'model' | 'browserWebAccess' | 'coworkMemory' | 'coworkDreaming' | 'shortcuts' | 'im' | 'email' | 'plugins' | 'about';
+
+const waitForNextPaint = (): Promise<void> => new Promise(resolve => {
+  window.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => resolve());
+  });
+});
+
+const formatBackupSize = (sizeBytes?: number): string => {
+  if (!Number.isFinite(sizeBytes) || !sizeBytes || sizeBytes <= 0) return '';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = sizeBytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+};
+
+const normalizeProvidersForSettingsSave = (providers: ProvidersConfig): ProvidersConfig => (
+  Object.fromEntries(
+    Object.entries(providers).map(([providerKey, providerConfig]) => {
+      const apiFormat = getEffectiveApiFormat(providerKey, providerConfig.apiFormat);
+      const hasValidAuth = hasProviderAuthConfigured(providerKey as ProviderType, providerConfig);
+      return [
+        providerKey,
+        {
+          ...providerConfig,
+          enabled: providerConfig.enabled && hasValidAuth,
+          apiFormat,
+          ...(providerKey === ProviderName.Copilot ? { apiKey: '' } : {}),
+          baseUrl: resolveBaseUrl(providerKey as ProviderType, providerConfig.baseUrl, apiFormat),
+        },
+      ];
+    })
+  ) as ProvidersConfig
+);
+
+const resolvePrimaryProviderForSettingsSave = (
+  providers: ProvidersConfig,
+  activeProvider: ProviderType,
+): ProviderConfig => {
+  const firstEnabledProvider = Object.entries(providers).find(
+    ([_, config]) => config.enabled
+  );
+  return firstEnabledProvider
+    ? firstEnabledProvider[1]
+    : providers[activeProvider];
+};
+
+type ShortcutCommandDefinition = {
+  key: ShortcutAction;
+  labelKey: string;
+  descriptionKey: string;
+  inputType?: 'recorder' | 'send';
+  slot?: number;
+  tabLabelKey?: string;
+};
+
+const SETTINGS_TAB_SHORTCUT_ACTIONS: Partial<Record<ShortcutAction, TabType>> = {
+  [ShortcutAction.OpenSettingsGeneral]: 'general',
+  [ShortcutAction.OpenSettingsAppearance]: 'appearance',
+  [ShortcutAction.OpenSettingsAgentEngine]: 'coworkAgentEngine',
+  [ShortcutAction.OpenSettingsModel]: 'model',
+  [ShortcutAction.OpenSettingsIm]: 'im',
+  [ShortcutAction.OpenSettingsBrowser]: 'browserWebAccess',
+  [ShortcutAction.OpenSettingsEmail]: 'email',
+  [ShortcutAction.OpenSettingsMemory]: 'coworkMemory',
+  [ShortcutAction.OpenSettingsDreaming]: 'coworkDreaming',
+  [ShortcutAction.OpenSettingsPlugins]: 'plugins',
+  [ShortcutAction.OpenSettingsShortcuts]: 'shortcuts',
+  [ShortcutAction.OpenSettingsAbout]: 'about',
+};
+
+const AGENT_TASK_SLOT_COMMANDS: ShortcutCommandDefinition[] = [
+  ShortcutAction.OpenAgentTask1,
+  ShortcutAction.OpenAgentTask2,
+  ShortcutAction.OpenAgentTask3,
+  ShortcutAction.OpenAgentTask4,
+  ShortcutAction.OpenAgentTask5,
+  ShortcutAction.OpenAgentTask6,
+  ShortcutAction.OpenAgentTask7,
+  ShortcutAction.OpenAgentTask8,
+  ShortcutAction.OpenAgentTask9,
+].map((key, index) => ({
+  key,
+  labelKey: 'shortcutOpenAgentTaskSlot',
+  descriptionKey: 'shortcutDescOpenAgentTaskSlot',
+  slot: index + 1,
+}));
+
+const SETTINGS_TAB_SHORTCUT_COMMANDS: ShortcutCommandDefinition[] = [
+  { key: ShortcutAction.OpenSettingsGeneral, tabLabelKey: 'general' },
+  { key: ShortcutAction.OpenSettingsAppearance, tabLabelKey: 'appearance' },
+  { key: ShortcutAction.OpenSettingsAgentEngine, tabLabelKey: 'coworkAgentEngine' },
+  { key: ShortcutAction.OpenSettingsModel, tabLabelKey: 'settingsCustomModel' },
+  { key: ShortcutAction.OpenSettingsIm, tabLabelKey: 'imBot' },
+  { key: ShortcutAction.OpenSettingsBrowser, tabLabelKey: 'browserWebAccessTab' },
+  { key: ShortcutAction.OpenSettingsEmail, tabLabelKey: 'emailTab' },
+  { key: ShortcutAction.OpenSettingsMemory, tabLabelKey: 'coworkMemoryTitle' },
+  { key: ShortcutAction.OpenSettingsDreaming, tabLabelKey: 'coworkMemoryTabDreaming' },
+  { key: ShortcutAction.OpenSettingsPlugins, tabLabelKey: 'pluginsTab' },
+  { key: ShortcutAction.OpenSettingsShortcuts, tabLabelKey: 'shortcuts' },
+  { key: ShortcutAction.OpenSettingsAbout, tabLabelKey: 'about' },
+].map(command => ({
+  ...command,
+  labelKey: 'shortcutOpenSettingsTab',
+  descriptionKey: 'shortcutDescOpenSettingsTab',
+}));
+
+const SHORTCUT_COMMAND_GROUPS: Array<{
+  titleKey: string;
+  commands: ShortcutCommandDefinition[];
+}> = [
+  {
+    titleKey: 'shortcutGroupCowork',
+    commands: [
+      { key: ShortcutAction.NewChat, labelKey: 'newChat', descriptionKey: 'shortcutDescNewChat' },
+      { key: ShortcutAction.FocusPrompt, labelKey: 'shortcutFocusPrompt', descriptionKey: 'shortcutDescFocusPrompt' },
+      { key: ShortcutAction.StopCurrentTask, labelKey: 'shortcutStopCurrentTask', descriptionKey: 'shortcutDescStopCurrentTask' },
+      { key: ShortcutAction.Search, labelKey: 'search', descriptionKey: 'shortcutDescSearch' },
+      { key: ShortcutAction.ToggleArtifacts, labelKey: 'shortcutToggleArtifacts', descriptionKey: 'shortcutDescToggleArtifacts' },
+      {
+        key: ShortcutAction.SendMessage,
+        labelKey: 'sendMessageShortcut',
+        descriptionKey: 'shortcutDescSendMessage',
+        inputType: 'send',
+      },
+    ],
+  },
+  {
+    titleKey: 'shortcutGroupNavigation',
+    commands: [
+      { key: ShortcutAction.OpenCowork, labelKey: 'shortcutOpenCowork', descriptionKey: 'shortcutDescOpenCowork' },
+      { key: ShortcutAction.OpenScheduledTasks, labelKey: 'shortcutOpenScheduledTasks', descriptionKey: 'shortcutDescOpenScheduledTasks' },
+      { key: ShortcutAction.OpenKits, labelKey: 'shortcutOpenKits', descriptionKey: 'shortcutDescOpenKits' },
+      { key: ShortcutAction.OpenSkills, labelKey: 'shortcutOpenSkills', descriptionKey: 'shortcutDescOpenSkills' },
+      { key: ShortcutAction.OpenMcp, labelKey: 'shortcutOpenMcp', descriptionKey: 'shortcutDescOpenMcp' },
+      { key: ShortcutAction.ToggleSidebar, labelKey: 'shortcutToggleSidebar', descriptionKey: 'shortcutDescToggleSidebar' },
+    ],
+  },
+  {
+    titleKey: 'shortcutGroupApp',
+    commands: [
+      { key: ShortcutAction.Settings, labelKey: 'openSettings', descriptionKey: 'shortcutDescSettings' },
+      { key: ShortcutAction.ShowShortcuts, labelKey: 'shortcutShowShortcuts', descriptionKey: 'shortcutDescShowShortcuts' },
+    ],
+  },
+  {
+    titleKey: 'shortcutGroupAgent',
+    commands: [
+      { key: ShortcutAction.PreviousAgent, labelKey: 'shortcutPreviousAgent', descriptionKey: 'shortcutDescPreviousAgent' },
+      { key: ShortcutAction.NextAgent, labelKey: 'shortcutNextAgent', descriptionKey: 'shortcutDescNextAgent' },
+      {
+        key: ShortcutAction.ShowCurrentAgentTasks,
+        labelKey: 'shortcutShowCurrentAgentTasks',
+        descriptionKey: 'shortcutDescShowCurrentAgentTasks',
+      },
+      ...AGENT_TASK_SLOT_COMMANDS,
+    ],
+  },
+  {
+    titleKey: 'shortcutGroupSettingsTabs',
+    commands: SETTINGS_TAB_SHORTCUT_COMMANDS,
+  },
+];
+
+const SHORTCUT_COMMANDS = SHORTCUT_COMMAND_GROUPS.flatMap(group => group.commands);
+
+const getShortcutCommandText = (
+  command: ShortcutCommandDefinition,
+  field: 'labelKey' | 'descriptionKey',
+) => {
+  const value = i18nService.t(command[field]);
+  return value
+    .replace('{slot}', String(command.slot ?? ''))
+    .replace('{tab}', command.tabLabelKey ? i18nService.t(command.tabLabelKey) : '');
+};
 
 const SettingsSlidersIcon: React.FC<{ className?: string }> = ({ className }) => (
   <svg
@@ -112,6 +297,7 @@ export type SettingsOpenOptions = {
 
 interface SettingsProps extends SettingsOpenOptions {
   onClose: () => void;
+  initialTabRequestId?: number;
   onUpdateFound?: (info: AppUpdateInfo) => void;
   enterpriseConfig?: {
     ui?: Record<string, 'hide' | 'disable' | 'readonly'>;
@@ -272,6 +458,21 @@ const isSystemShortcut = (e: KeyboardEvent): boolean => {
   return false;
 };
 
+const isShortcutInputActive = () => {
+  const activeElement = document.activeElement;
+  if (!(activeElement instanceof HTMLElement)) return false;
+  return activeElement.dataset.shortcutInput === 'true';
+};
+
+const isTextEditingActive = () => {
+  const activeElement = document.activeElement;
+  if (!(activeElement instanceof HTMLElement)) return false;
+  if (activeElement.isContentEditable) return true;
+  if (activeElement instanceof HTMLTextAreaElement) return true;
+  if (activeElement instanceof HTMLSelectElement) return true;
+  return activeElement instanceof HTMLInputElement;
+};
+
 const formatShortcutFromEvent = (e: React.KeyboardEvent): string | null => {
   // Skip standalone modifier keys
   if (['Meta', 'Control', 'Alt', 'Shift'].includes(e.key)) return null;
@@ -282,7 +483,7 @@ const formatShortcutFromEvent = (e: React.KeyboardEvent): string | null => {
   const parts: string[] = [];
   if (e.metaKey) parts.push('Cmd');
   if (e.ctrlKey) parts.push('Ctrl');
-  if (e.altKey) parts.push('Alt');
+  if (e.altKey) parts.push(isMacPlatform ? 'Option' : 'Alt');
   if (e.shiftKey) parts.push('Shift');
 
   const keyMap: Record<string, string> = {
@@ -304,9 +505,16 @@ const SEND_SHORTCUT_OPTIONS = [
 
 const isMacPlatform = navigator.platform.includes('Mac');
 
-const ShortcutRecorder: React.FC<{ value: string; onChange: (v: string) => void }> = ({ value, onChange }) => {
+const ShortcutRecorder: React.FC<{
+  value: string;
+  label: string;
+  onChange: (v: string) => void;
+}> = ({ value, label, onChange }) => {
   const [recording, setRecording] = useState(false);
-  const divRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const recorderRef = useRef<HTMLButtonElement>(null);
+  const displayValue = formatShortcutForDisplay(value, { isMac: isMacPlatform });
+  const editLabel = i18nService.t('shortcutEditCommand').replace('{command}', label);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (!recording) return;
@@ -321,28 +529,58 @@ const ShortcutRecorder: React.FC<{ value: string; onChange: (v: string) => void 
   useEffect(() => {
     if (!recording) return;
     const handleClickOutside = (e: MouseEvent) => {
-      if (divRef.current && !divRef.current.contains(e.target as Node)) setRecording(false);
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) setRecording(false);
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [recording]);
 
+  useEffect(() => {
+    if (!recording) return;
+    window.setTimeout(() => recorderRef.current?.focus(), 0);
+  }, [recording]);
+
+  if (recording) {
+    return (
+      <div ref={containerRef} className="flex items-center gap-3">
+        <button
+          ref={recorderRef}
+          type="button"
+          data-shortcut-input="true"
+          onKeyDown={handleKeyDown}
+          className="h-8 min-w-[8rem] rounded-xl border border-border bg-surface px-4 text-xs font-medium text-foreground shadow-sm outline-none transition-colors focus:border-primary focus:ring-1 focus:ring-primary/25"
+        >
+          {i18nService.t('shortcutPressShortcut')}
+        </button>
+        <button
+          type="button"
+          data-shortcut-input="true"
+          onClick={() => setRecording(false)}
+          className="text-xs font-medium text-secondary transition-colors hover:text-foreground"
+        >
+          {i18nService.t('cancel')}
+        </button>
+      </div>
+    );
+  }
+
   return (
-    <div
-      ref={divRef}
-      tabIndex={0}
-      data-shortcut-input="true"
-      onKeyDown={handleKeyDown}
-      onClick={() => setRecording(true)}
-      onBlur={() => setRecording(false)}
-      className={`w-36 rounded-xl border px-3 py-1.5 text-sm cursor-pointer select-none text-center outline-none transition-colors
-        dark:bg-claude-darkSurfaceInset bg-claude-surfaceInset dark:text-claude-darkText text-claude-text
-        ${recording
-          ? 'border-claude-accent ring-1 ring-claude-accent/30 dark:text-claude-darkTextSecondary text-claude-textSecondary'
-          : 'dark:border-claude-darkBorder border-claude-border hover:border-claude-accent/50'
-        }`}
-    >
-      {value || i18nService.t('shortcutNotSet')}
+    <div className="flex items-center gap-2">
+      <span
+        title={displayValue || i18nService.t('shortcutNotSet')}
+        className="min-w-[5.5rem] max-w-[9rem] truncate rounded-full bg-surface-raised px-3 py-1 text-center text-xs font-medium text-secondary"
+      >
+        {displayValue || i18nService.t('shortcutNotSet')}
+      </span>
+      <button
+        type="button"
+        onClick={() => setRecording(true)}
+        title={editLabel}
+        aria-label={editLabel}
+        className="pointer-events-none inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-secondary opacity-0 transition-colors hover:bg-surface-raised hover:text-foreground group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100"
+      >
+        <EditIcon className="h-4 w-4" />
+      </button>
     </div>
   );
 };
@@ -362,46 +600,50 @@ const SendShortcutSelect: React.FC<{ value: string; onChange: (v: string) => voi
 
   const currentLabel = (() => {
     const opt = SEND_SHORTCUT_OPTIONS.find(o => o.value === value);
-    if (!opt) return value;
+    if (!value) return i18nService.t('shortcutNotSet');
+    if (!opt) return formatShortcutForDisplay(value, { isMac: isMacPlatform });
     return isMacPlatform ? opt.labelMac : opt.label;
   })();
 
   return (
-    <div ref={containerRef} className="relative">
-      <div
-        onClick={() => setOpen(!open)}
-        className={`w-36 rounded-xl border px-3 py-1.5 text-sm cursor-pointer select-none text-center outline-none transition-colors
-          dark:bg-claude-darkSurfaceInset bg-claude-surfaceInset dark:text-claude-darkText text-claude-text
-          ${open
-            ? 'border-claude-accent ring-1 ring-claude-accent/30'
-            : 'dark:border-claude-darkBorder border-claude-border hover:border-claude-accent/50'
-          }`}
-      >
-        {currentLabel}
-      </div>
-      {open && (
-        <div className="absolute right-0 mt-1 z-50 min-w-[160px] rounded-xl border dark:border-claude-darkBorder border-claude-border dark:bg-claude-darkSurfaceInset bg-claude-surfaceInset shadow-elevated py-1">
-          {SEND_SHORTCUT_OPTIONS.map((option) => {
-            const label = isMacPlatform ? option.labelMac : option.label;
-            const isActive = value === option.value;
-            return (
-              <button
-                key={option.value}
-                type="button"
-                onClick={() => { onChange(option.value); setOpen(false); }}
-                className={`flex items-center justify-between w-full px-3 py-1.5 text-sm transition-colors
-                  ${isActive
-                    ? 'dark:text-claude-accent text-claude-accent font-medium'
-                    : 'dark:text-claude-darkText text-claude-text'
-                  } hover:bg-claude-accent/10`}
-              >
-                <span>{label}</span>
-                {isActive && <span className="text-claude-accent">✓</span>}
-              </button>
-            );
-          })}
+    <div ref={containerRef} className="flex items-center gap-2">
+      <div className="relative">
+        <div
+          onClick={() => setOpen(!open)}
+          className={`w-28 rounded-lg border px-2.5 py-1 text-xs cursor-pointer select-none text-center outline-none transition-colors
+            dark:bg-claude-darkSurfaceInset bg-claude-surfaceInset dark:text-claude-darkText text-claude-text
+            ${open
+              ? 'border-claude-accent ring-1 ring-claude-accent/30'
+              : 'dark:border-claude-darkBorder border-claude-border hover:border-claude-accent/50'
+            }`}
+        >
+          {currentLabel}
         </div>
-      )}
+        {open && (
+          <div className="absolute right-0 mt-1 z-50 min-w-[160px] rounded-xl border dark:border-claude-darkBorder border-claude-border dark:bg-claude-darkSurfaceInset bg-claude-surfaceInset shadow-elevated py-1">
+            {SEND_SHORTCUT_OPTIONS.map((option) => {
+              const label = isMacPlatform ? option.labelMac : option.label;
+              const isActive = value === option.value;
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => { onChange(option.value); setOpen(false); }}
+                  className={`flex items-center justify-between w-full px-3 py-1.5 text-xs transition-colors
+                    ${isActive
+                      ? 'dark:text-claude-accent text-claude-accent font-medium'
+                      : 'dark:text-claude-darkText text-claude-text'
+                    } hover:bg-claude-accent/10`}
+                >
+                  <span>{label}</span>
+                  {isActive && <span className="text-claude-accent">✓</span>}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+      <span className="h-6 w-6 shrink-0" aria-hidden="true" />
     </div>
   );
 };
@@ -462,7 +704,16 @@ const SettingsToggleRow: React.FC<{
   </div>
 );
 
-const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, noticeI18nKey, noticeExtra, onUpdateFound, enterpriseConfig }) => {
+const Settings: React.FC<SettingsProps> = ({
+  onClose,
+  initialTab,
+  initialTabRequestId,
+  notice,
+  noticeI18nKey,
+  noticeExtra,
+  onUpdateFound,
+  enterpriseConfig,
+}) => {
   const dispatch = useDispatch();
   // 状态
   const [activeTab, setActiveTab] = useState<TabType>(initialTab ?? 'general');
@@ -472,6 +723,7 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
   const [autoLaunch, setAutoLaunchState] = useState(false);
   const [useSystemProxy, setUseSystemProxy] = useState(false);
   const [sqliteAutoBackupEnabled, setSqliteAutoBackupEnabled] = useState(false);
+  const [taskCompletionNotificationsEnabled, setTaskCompletionNotificationsEnabled] = useState(true);
   const [browserWebAccess, setBrowserWebAccess] = useState<BrowserWebAccessConfig>(() => ({
     ...defaultBrowserWebAccessConfig,
     webFetch: { ...defaultBrowserWebAccessConfig.webFetch },
@@ -500,6 +752,9 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
   const initialThemeIdRef = useRef<string>(themeService.getThemeId());
   const initialLanguageRef = useRef<LanguageType>(i18nService.getLanguage());
   const didSaveRef = useRef(false);
+
+  // Plugin settings handle (deferred save)
+  const pluginsSettingsRef = useRef<PluginsSettingsHandle>(null);
 
   // Add state for active provider
   const [activeProvider, setActiveProvider] = useState<ProviderType>(getDefaultActiveProvider());
@@ -537,15 +792,12 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
   const contentRef = useRef<HTMLDivElement>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const emailCopiedTimerRef = useRef<number | null>(null);
+  const openClawGatewayCopiedTimerRef = useRef<number | null>(null);
   const updateCheckTimerRef = useRef<number | null>(null);
 
   // 快捷键设置
-  const [shortcuts, setShortcuts] = useState({
-    newChat: 'Ctrl+N',
-    search: 'Ctrl+F',
-    settings: 'Ctrl+,',
-    sendMessage: defaultConfig.shortcuts!.sendMessage,
-  });
+  const [shortcuts, setShortcuts] = useState<ShortcutConfig>(() => ({ ...defaultConfig.shortcuts! }));
+  const [shortcutSearchQuery, setShortcutSearchQuery] = useState('');
 
   // GitHub Copilot device code auth state
   const [copilotAuthStatus, setCopilotAuthStatus] = useState<'idle' | 'requesting' | 'awaiting_user' | 'polling' | 'authenticated' | 'error'>('idle');
@@ -772,6 +1024,14 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
   const [coworkMemoryDraftText, setCoworkMemoryDraftText] = useState<string>('');
   const [showMemoryModal, setShowMemoryModal] = useState<boolean>(false);
   const [openClawEngineStatus, setOpenClawEngineStatus] = useState<OpenClawEngineStatus | null>(null);
+  const [showOpenClawRepairConfirm, setShowOpenClawRepairConfirm] = useState<boolean>(false);
+  const [isRepairingOpenClaw, setIsRepairingOpenClaw] = useState<boolean>(false);
+  const [openClawRepairResult, setOpenClawRepairResult] = useState<OpenClawGatewayRepairResult | null>(null);
+  const [openClawGatewayCopied, setOpenClawGatewayCopied] = useState<boolean>(false);
+  const [isBackingUpOpenClawData, setIsBackingUpOpenClawData] = useState<boolean>(false);
+  const [isRestoringOpenClawData, setIsRestoringOpenClawData] = useState<boolean>(false);
+  const [openClawDataBackupResult, setOpenClawDataBackupResult] = useState<{ path: string; sizeBytes?: number } | null>(null);
+  const [showOpenClawDataRestoreConfirm, setShowOpenClawDataRestoreConfirm] = useState<boolean>(false);
 
   useEffect(() => {
     setCoworkAgentEngine(coworkConfig.agentEngine || 'openclaw');
@@ -813,9 +1073,33 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
     if (emailCopiedTimerRef.current != null) {
       window.clearTimeout(emailCopiedTimerRef.current);
     }
+    if (openClawGatewayCopiedTimerRef.current != null) {
+      window.clearTimeout(openClawGatewayCopiedTimerRef.current);
+    }
     if (updateCheckTimerRef.current != null) {
       window.clearTimeout(updateCheckTimerRef.current);
     }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void window.electron.openclaw.dataMigration.getLastRestoreResult().then((response) => {
+      if (!active || !response.success || !response.result) return;
+      if (response.result.status === DataMigrationRestoreStatus.Success) {
+        setNoticeMessage(i18nService.t('openClawDataMigrationSuccess'));
+        return;
+      }
+      const message = response.result.error
+        ? `${i18nService.t('openClawDataMigrationFailed')}: ${response.result.error}`
+        : i18nService.t('openClawDataMigrationFailed');
+      setError(message);
+    }).catch((loadError) => {
+      if (!active) return;
+      setError(loadError instanceof Error ? loadError.message : i18nService.t('openClawDataMigrationFailed'));
+    });
+    return () => {
+      active = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -845,6 +1129,9 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
       setLanguage(config.language);
       setUseSystemProxy(config.useSystemProxy ?? false);
       setSqliteAutoBackupEnabled(config.sqliteAutoBackupEnabled === true);
+      setTaskCompletionNotificationsEnabled(
+        normalizeNotificationSettings(config.notificationSettings).taskCompletionNotificationsEnabled,
+      );
       setBrowserWebAccess(normalizeBrowserWebAccessConfig(config.browserWebAccess));
       const savedTestMode = config.app?.testMode ?? false;
       setTestMode(savedTestMode);
@@ -1055,6 +1342,9 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
                 {
                   ...providerConfig,
                   apiFormat: getEffectiveApiFormat(providerKey, (providerConfig as ProviderConfig).apiFormat),
+                  ...(providerKey === ProviderName.Copilot && providerConfig.apiKey?.trim()
+                    ? { authType: ProviderAuthType.OAuth, apiKey: '' }
+                    : {}),
                   models,
                 },
               ];
@@ -1103,7 +1393,7 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
     if (initialTab) {
       setActiveTab(initialTab);
     }
-  }, [initialTab]);
+  }, [initialTab, initialTabRequestId]);
 
   // Subscribe to language changes
   useEffect(() => {
@@ -1553,29 +1843,241 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
     return Math.max(0, Math.min(100, Math.round(openClawEngineStatus.progressPercent)));
   }, [openClawEngineStatus]);
 
+  const openClawStatusTone = useMemo(() => {
+    const phase = openClawEngineStatus?.phase;
+
+    if (phase === OpenClawEnginePhase.Error) {
+      return {
+        Icon: ExclamationTriangleIcon,
+        iconClassName: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
+        progressClassName: 'bg-red-500',
+        spinIcon: false,
+        inProgress: false,
+        badgeLabelKey: 'openClawStatusBadgeError',
+        badgeClassName: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
+        badgeDotClassName: 'bg-red-500',
+      };
+    }
+
+    if (phase === OpenClawEnginePhase.Running || phase === OpenClawEnginePhase.Ready) {
+      return {
+        Icon: CheckCircleIcon,
+        iconClassName: 'bg-primary-muted text-primary',
+        progressClassName: 'bg-primary',
+        spinIcon: false,
+        inProgress: false,
+        badgeLabelKey: phase === OpenClawEnginePhase.Running
+          ? 'openClawStatusBadgeRunning'
+          : 'openClawStatusBadgeReady',
+        badgeClassName: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300',
+        badgeDotClassName: 'bg-emerald-500',
+      };
+    }
+
+    if (phase === OpenClawEnginePhase.Installing || phase === OpenClawEnginePhase.Starting) {
+      return {
+        Icon: ArrowPathIcon,
+        iconClassName: 'bg-primary-muted text-primary',
+        progressClassName: 'bg-primary',
+        spinIcon: true,
+        inProgress: true,
+        badgeLabelKey: phase === OpenClawEnginePhase.Installing
+          ? 'openClawStatusBadgeInstalling'
+          : 'openClawStatusBadgeStarting',
+        badgeClassName: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
+        badgeDotClassName: 'bg-amber-500',
+      };
+    }
+
+    return {
+      Icon: CpuChipIcon,
+      iconClassName: 'bg-surface-raised text-secondary',
+      progressClassName: 'bg-primary',
+      spinIcon: false,
+      inProgress: false,
+      badgeLabelKey: 'openClawStatusBadgeNotInstalled',
+      badgeClassName: 'bg-surface-raised text-secondary',
+      badgeDotClassName: 'bg-secondary/60',
+    };
+  }, [openClawEngineStatus?.phase]);
+
+  const OpenClawStatusIcon = openClawStatusTone.Icon;
+  const openClawGatewayHttpUrl = openClawEngineStatus?.gatewayHttpUrl?.trim() || null;
+
+  const handleCopyOpenClawGatewayUrl = useCallback(async () => {
+    if (!openClawGatewayHttpUrl) return;
+    const copied = await copyTextToClipboard(openClawGatewayHttpUrl);
+    if (!copied) return;
+
+    setOpenClawGatewayCopied(true);
+    if (openClawGatewayCopiedTimerRef.current != null) {
+      window.clearTimeout(openClawGatewayCopiedTimerRef.current);
+    }
+    openClawGatewayCopiedTimerRef.current = window.setTimeout(() => {
+      setOpenClawGatewayCopied(false);
+      openClawGatewayCopiedTimerRef.current = null;
+    }, 1200);
+  }, [openClawGatewayHttpUrl]);
+
+  useEffect(() => {
+    setOpenClawGatewayCopied(false);
+  }, [openClawGatewayHttpUrl]);
+
   const resolveOpenClawStatusText = (status: OpenClawEngineStatus | null): string => {
     if (!status) {
       return i18nService.t('coworkOpenClawNotInstalledNotice');
     }
-    if (status.message?.trim()) {
-      return status.message.trim();
-    }
     switch (status.phase) {
-      case 'not_installed':
+      case OpenClawEnginePhase.NotInstalled:
         return i18nService.t('coworkOpenClawNotInstalledNotice');
-      case 'installing':
+      case OpenClawEnginePhase.Installing:
         return i18nService.t('coworkOpenClawInstalling');
-      case 'ready':
+      case OpenClawEnginePhase.Ready:
         return i18nService.t('coworkOpenClawReadyNotice');
-      case 'starting':
+      case OpenClawEnginePhase.Starting:
         return i18nService.t('coworkOpenClawStarting');
-      case 'error':
+      case OpenClawEnginePhase.Error:
         return i18nService.t('coworkOpenClawError');
-      case 'running':
-      default:
+      case OpenClawEnginePhase.Running:
         return i18nService.t('coworkOpenClawRunning');
+      default:
+        return status.message?.trim() || i18nService.t('coworkOpenClawRunning');
     }
   };
+
+  const resolveOpenClawStatusDescription = (status: OpenClawEngineStatus | null): string => {
+    return status?.gatewayHttpUrl || i18nService.t('coworkOpenClawInstallHint');
+  };
+
+  const resolveOpenClawRepairMessage = (result: OpenClawGatewayRepairResult): string => {
+    if (result.success) {
+      return result.backupPath
+        ? i18nService.t('openClawRepairSuccess')
+        : i18nService.t('openClawRepairSuccessNoBackup');
+    }
+    if (result.errorCode === OpenClawGatewayRepairErrorCode.Busy) {
+      return i18nService.t('openClawRepairBusyError');
+    }
+    if (result.errorCode === OpenClawGatewayRepairErrorCode.ConfigApplyPending) {
+      return i18nService.t('openClawRepairConfigApplyPendingError');
+    }
+    return result.error?.trim() || i18nService.t('openClawRepairFailed');
+  };
+
+  const handleConfirmOpenClawRepair = useCallback(async () => {
+    if (isRepairingOpenClaw) return;
+    setShowOpenClawRepairConfirm(false);
+    setOpenClawRepairResult(null);
+    setError(null);
+    setIsRepairingOpenClaw(true);
+    try {
+      const result = await coworkService.repairOpenClawGatewayState();
+      setOpenClawRepairResult(result);
+    } catch (repairError) {
+      setOpenClawRepairResult({
+        success: false,
+        error: repairError instanceof Error ? repairError.message : i18nService.t('openClawRepairFailed'),
+      });
+    } finally {
+      setIsRepairingOpenClaw(false);
+    }
+  }, [isRepairingOpenClaw]);
+
+  const handleRevealOpenClawRepairBackup = useCallback(async () => {
+    const backupPath = openClawRepairResult?.backupPath;
+    if (!backupPath) return;
+    try {
+      const result = await window.electron.shell.showItemInFolder(backupPath);
+      if (!result?.success) {
+        setError(result?.error || i18nService.t('showInFolderFailed'));
+      }
+    } catch (revealError) {
+      setError(revealError instanceof Error ? revealError.message : i18nService.t('showInFolderFailed'));
+    }
+  }, [openClawRepairResult?.backupPath]);
+
+  const handleRevealOpenClawDataBackup = useCallback(async () => {
+    const backupPath = openClawDataBackupResult?.path;
+    if (!backupPath) return;
+    try {
+      const result = await window.electron.shell.showItemInFolder(backupPath);
+      if (!result?.success) {
+        setError(result?.error || i18nService.t('showInFolderFailed'));
+      }
+    } catch (revealError) {
+      setError(revealError instanceof Error ? revealError.message : i18nService.t('showInFolderFailed'));
+    }
+  }, [openClawDataBackupResult?.path]);
+
+  const persistModelSettingsBeforeDataBackup = useCallback(async () => {
+    const normalizedProviders = normalizeProvidersForSettingsSave(providers);
+    const primaryProvider = resolvePrimaryProviderForSettingsSave(normalizedProviders, activeProvider);
+    await configService.updateConfig({
+      api: {
+        key: primaryProvider.apiKey,
+        baseUrl: primaryProvider.baseUrl,
+      },
+      providers: normalizedProviders,
+    });
+  }, [activeProvider, providers]);
+
+  const handleOpenClawDataBackup = useCallback(async () => {
+    if (isBackingUpOpenClawData) return;
+    setError(null);
+    setNoticeMessage(null);
+    setOpenClawDataBackupResult(null);
+    setIsBackingUpOpenClawData(true);
+    try {
+      await waitForNextPaint();
+      await persistModelSettingsBeforeDataBackup();
+      const result = await window.electron.openclaw.dataMigration.backup();
+      if (!result.success) {
+        setError(result.error || i18nService.t('openClawDataBackupFailed'));
+        return;
+      }
+      if (result.canceled) {
+        return;
+      }
+      if (result.path) {
+        setOpenClawDataBackupResult({ path: result.path, sizeBytes: result.sizeBytes });
+      }
+      setNoticeMessage(i18nService.t('openClawDataBackupSuccess'));
+    } catch (backupError) {
+      setError(backupError instanceof Error ? backupError.message : i18nService.t('openClawDataBackupFailed'));
+    } finally {
+      setIsBackingUpOpenClawData(false);
+    }
+  }, [isBackingUpOpenClawData, persistModelSettingsBeforeDataBackup]);
+
+  const handleConfirmOpenClawDataRestore = useCallback(async () => {
+    if (isRestoringOpenClawData) return;
+    setShowOpenClawDataRestoreConfirm(false);
+    setError(null);
+    setNoticeMessage(null);
+    setIsRestoringOpenClawData(true);
+    let keepLoadingUntilRestart = false;
+    try {
+      await waitForNextPaint();
+      const result = await window.electron.openclaw.dataMigration.restore();
+      if (!result.success) {
+        setError(result.error || i18nService.t('openClawDataMigrationFailed'));
+        return;
+      }
+      if (result.canceled) {
+        return;
+      }
+      if (result.scheduledRestart) {
+        keepLoadingUntilRestart = true;
+        setNoticeMessage(i18nService.t('openClawDataMigrationRestarting'));
+      }
+    } catch (restoreError) {
+      setError(restoreError instanceof Error ? restoreError.message : i18nService.t('openClawDataMigrationFailed'));
+    } finally {
+      if (!keepLoadingUntilRestart) {
+        setIsRestoringOpenClawData(false);
+      }
+    }
+  }, [isRestoringOpenClawData]);
 
   const loadCoworkMemoryData = useCallback(async () => {
     setCoworkMemoryListLoading(true);
@@ -1668,7 +2170,7 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
     const hasValidAuth = hasProviderAuthConfigured(provider, providerConfig);
 
     // GitHub Copilot requires device code auth — redirect to sign-in flow
-    if (provider === 'github-copilot' && isEnabling && !providerConfig.apiKey.trim()) {
+    if (provider === ProviderName.Copilot && isEnabling && !hasValidAuth) {
       handleCopilotSignIn();
       return;
     }
@@ -1728,13 +2230,19 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
         setCopilotGithubUser(result.githubUser || '');
         setCopilotAuthStatus('authenticated');
 
-        // Store the Copilot API token in the provider's apiKey field
-        handleProviderConfigChange('github-copilot', 'apiKey', result.token);
-        if (result.baseUrl) {
-          handleProviderConfigChange('github-copilot', 'baseUrl', result.baseUrl);
-        }
-        // Auto-enable the provider
-        enableProvider('github-copilot');
+        apiService.setProviderRuntimeCredential(ProviderName.Copilot, {
+          apiKey: result.token,
+          ...(result.baseUrl ? { baseUrl: result.baseUrl } : {}),
+        });
+        setProviders(prev => ({
+          ...prev,
+          [ProviderName.Copilot]: {
+            ...prev[ProviderName.Copilot],
+            enabled: true,
+            authType: ProviderAuthType.OAuth,
+            apiKey: '',
+          },
+        }));
       } else {
         setCopilotError(result.error || 'Authentication failed');
         setCopilotAuthStatus('error');
@@ -1752,12 +2260,15 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
       setCopilotGithubUser('');
       setCopilotUserCode('');
       setCopilotError(null);
-      // Clear the token from provider config
-      handleProviderConfigChange('github-copilot', 'apiKey', '');
-      // Disable the provider
+      apiService.setProviderRuntimeCredential(ProviderName.Copilot, null);
       setProviders(prev => ({
         ...prev,
-        'github-copilot': { ...prev['github-copilot'], enabled: false },
+        [ProviderName.Copilot]: {
+          ...prev[ProviderName.Copilot],
+          enabled: false,
+          authType: ProviderAuthType.ApiKey,
+          apiKey: '',
+        },
       }));
     } catch (error) {
       console.error('[Settings] GitHub Copilot sign-out failed:', error);
@@ -1781,30 +2292,8 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
     setError(null);
 
     try {
-      const normalizedProviders = Object.fromEntries(
-        Object.entries(providers).map(([providerKey, providerConfig]) => {
-          const apiFormat = getEffectiveApiFormat(providerKey, providerConfig.apiFormat);
-          const hasValidAuth = hasProviderAuthConfigured(providerKey as ProviderType, providerConfig);
-          return [
-            providerKey,
-            {
-              ...providerConfig,
-              enabled: providerConfig.enabled && hasValidAuth,
-              apiFormat,
-              baseUrl: resolveBaseUrl(providerKey as ProviderType, providerConfig.baseUrl, apiFormat),
-            },
-          ];
-        })
-      ) as ProvidersConfig;
-
-      // Find the first enabled provider to use as the primary API
-      const firstEnabledProvider = Object.entries(normalizedProviders).find(
-        ([_, config]) => config.enabled
-      );
-
-      const primaryProvider = firstEnabledProvider
-        ? firstEnabledProvider[1]
-        : normalizedProviders[activeProvider];
+      const normalizedProviders = normalizeProvidersForSettingsSave(providers);
+      const primaryProvider = resolvePrimaryProviderForSettingsSave(normalizedProviders, activeProvider);
       const normalizedBrowserWebAccess = normalizeBrowserWebAccessConfig({
         ...browserWebAccess,
         browserEnabled: true,
@@ -1830,6 +2319,9 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
         language,
         useSystemProxy,
         sqliteAutoBackupEnabled,
+        notificationSettings: {
+          taskCompletionNotificationsEnabled,
+        },
         browserWebAccess: normalizedBrowserWebAccess,
         shortcuts,
         app: {
@@ -1910,6 +2402,15 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
         throw new Error(i18nService.t('settingsSavedButOpenClawSyncFailed'));
       }
 
+      // Batch save plugin changes (toggles + configs) if any pending
+      if (activeTab === 'plugins' && pluginsSettingsRef.current) {
+        const pendingChanges = pluginsSettingsRef.current.getPendingChanges();
+        if (pendingChanges) {
+          await window.electron?.plugins.batchSave(pendingChanges);
+          pluginsSettingsRef.current.resetDirty();
+        }
+      }
+
       didSaveRef.current = true;
       onClose();
     } catch (error) {
@@ -1920,7 +2421,7 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
   };
 
   // 标签页切换处理
-  const handleTabChange = (tab: TabType) => {
+  const doTabChange = useCallback((tab: TabType) => {
     if (tab !== 'model') {
       setIsAddingModel(false);
       setIsEditingModel(false);
@@ -1931,33 +2432,82 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
       setModelFormError(null);
     }
     setActiveTab(tab);
-  };
+  }, []);
 
-  // Mapping from shortcut key to i18n label key for conflict messages
-  const shortcutLabelMap: Record<string, string> = {
-    newChat: 'newChat',
-    search: 'search',
-    settings: 'openSettings',
-    sendMessage: 'sendMessageShortcut',
-  };
+  const handleTabChange = useCallback((tab: TabType) => {
+    if (isBackingUpOpenClawData || isRestoringOpenClawData) return;
+    if (activeTab === 'plugins' && pluginsSettingsRef.current?.guardLeave(() => doTabChange(tab))) {
+      return;
+    }
+    doTabChange(tab);
+  }, [activeTab, doTabChange, isBackingUpOpenClawData, isRestoringOpenClawData]);
+
+  // Guarded close: check plugin dirty state before closing
+  const guardedClose = useCallback(() => {
+    if (isBackingUpOpenClawData || isRestoringOpenClawData) return;
+    if (activeTab === 'plugins' && pluginsSettingsRef.current?.guardLeave(() => onClose())) {
+      return;
+    }
+    onClose();
+  }, [activeTab, isBackingUpOpenClawData, isRestoringOpenClawData, onClose]);
+
+  const shortcutCommandMap = useMemo(
+    () => new Map(SHORTCUT_COMMANDS.map(command => [command.key, command])),
+    [],
+  );
+
+  const filteredShortcutGroups = useMemo(() => {
+    const query = shortcutSearchQuery.trim().toLowerCase();
+    if (!query) return SHORTCUT_COMMAND_GROUPS;
+
+    return SHORTCUT_COMMAND_GROUPS
+      .map(group => ({
+        ...group,
+        commands: group.commands.filter(command => {
+          const haystack = [
+            getShortcutCommandText(command, 'labelKey'),
+            getShortcutCommandText(command, 'descriptionKey'),
+            shortcuts[command.key] ?? '',
+            formatShortcutForDisplay(shortcuts[command.key], { isMac: isMacPlatform }),
+          ].join(' ').toLowerCase();
+          return haystack.includes(query);
+        }),
+      }))
+      .filter(group => group.commands.length > 0);
+  }, [shortcutSearchQuery, shortcuts]);
 
   // 快捷键更新处理
-  const handleShortcutChange = (key: keyof typeof shortcuts, value: string) => {
+  const handleShortcutChange = (key: ShortcutAction, value: string) => {
+    const normalizedValue = value.trim();
     // Check for conflicts with other shortcuts
-    const conflictKey = Object.keys(shortcuts).find(
-      k => k !== key && shortcuts[k as keyof typeof shortcuts] === value
-    );
+    const normalizedSignature = getShortcutConflictSignature(normalizedValue, { isMac: isMacPlatform });
+    const conflictKey = normalizedSignature
+      ? Object.values(ShortcutAction).find((action) => {
+          if (action === key) return false;
+          return getShortcutConflictSignature(shortcuts[action], { isMac: isMacPlatform }) === normalizedSignature;
+        })
+      : undefined;
     if (conflictKey) {
-      const conflictLabel = i18nService.t(shortcutLabelMap[conflictKey] ?? conflictKey);
+      const conflictCommand = shortcutCommandMap.get(conflictKey);
+      const conflictLabel = conflictCommand
+        ? getShortcutCommandText(conflictCommand, 'labelKey')
+        : conflictKey;
       setNoticeMessage(
-        i18nService.t('shortcutConflict').replace('{0}', value).replace('{1}', conflictLabel)
+        i18nService
+          .t('shortcutConflict')
+          .replace('{0}', formatShortcutForDisplay(normalizedValue, { isMac: isMacPlatform }))
+          .replace('{1}', conflictLabel)
       );
       return;
     }
     setShortcuts(prev => ({
       ...prev,
-      [key]: value
+      [key]: normalizedValue
     }));
+  };
+
+  const handleResetShortcuts = () => {
+    setShortcuts({ ...defaultConfig.shortcuts! });
   };
 
   // 阻止点击设置窗口时事件传播到背景
@@ -2172,6 +2722,26 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
       // Determine effective API key
       let effectiveApiKey = providerConfig.apiKey;
 
+      if (testingProvider === ProviderName.Copilot) {
+        const result = await window.electron.githubCopilot.refreshToken();
+        if (!result.success || !result.token) {
+          showTestResultModal({
+            success: false,
+            message: result.error || i18nService.t('apiKeyRequired'),
+          }, testingProvider);
+          return;
+        }
+        effectiveApiKey = result.token;
+        if (result.baseUrl) {
+          effectiveBaseUrl = result.baseUrl;
+          normalizedBaseUrl = effectiveBaseUrl.replace(/\/+$/, '');
+        }
+        apiService.setProviderRuntimeCredential(ProviderName.Copilot, {
+          apiKey: result.token,
+          ...(result.baseUrl ? { baseUrl: result.baseUrl } : {}),
+        });
+      }
+
       if (testingProvider === 'qwen') {
         // Use regular API Key mode
         effectiveApiKey = providerConfig.apiKey;
@@ -2220,12 +2790,12 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
         if (effectiveApiKey) {
           headers.Authorization = `Bearer ${effectiveApiKey}`;
         }
-        if (testingProvider === 'github-copilot') {
-                  headers['Copilot-Integration-Id'] = 'vscode-chat';
-                  headers['Editor-Version'] = 'vscode/1.96.2';
-                  headers['Editor-Plugin-Version'] = 'copilot-chat/0.26.7';
-                  headers['User-Agent'] = 'GitHubCopilotChat/0.26.7';
-                  headers['Openai-Intent'] = 'conversation-panel';
+        if (testingProvider === ProviderName.Copilot) {
+          headers['Copilot-Integration-Id'] = 'vscode-chat';
+          headers['Editor-Version'] = 'vscode/1.96.2';
+          headers['Editor-Plugin-Version'] = 'copilot-chat/0.26.7';
+          headers['User-Agent'] = 'GitHubCopilotChat/0.26.7';
+          headers['Openai-Intent'] = 'conversation-panel';
         }
         const openAIRequestBody: Record<string, unknown> = useResponsesApi
           ? {
@@ -2602,6 +3172,26 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
     return sidebarTabs.find(t => t.key === activeTab)?.label ?? '';
   }, [activeTab, sidebarTabs]);
 
+  useEffect(() => {
+    const handleSettingsTabShortcut = (event: KeyboardEvent) => {
+      if (event.repeat || isShortcutInputActive() || isTextEditingActive()) return;
+
+      const command = SETTINGS_TAB_SHORTCUT_COMMANDS.find((candidate) => {
+        return matchesShortcut(event, shortcuts[candidate.key]);
+      });
+      if (!command) return;
+
+      const targetTab = SETTINGS_TAB_SHORTCUT_ACTIONS[command.key];
+      if (!targetTab || !sidebarTabs.some(tab => tab.key === targetTab)) return;
+
+      event.preventDefault();
+      handleTabChange(targetTab);
+    };
+
+    document.addEventListener('keydown', handleSettingsTabShortcut);
+    return () => document.removeEventListener('keydown', handleSettingsTabShortcut);
+  }, [shortcuts, sidebarTabs, handleTabChange]);
+
   const renderAppearanceSettings = () => (
     <div className="space-y-8">
       <div>
@@ -2865,6 +3455,15 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
             />
 
             <SettingsToggleRow
+              title={i18nService.t('taskCompletionNotifications')}
+              description={i18nService.t('taskCompletionNotificationsDescription')}
+              checked={taskCompletionNotificationsEnabled}
+              onToggle={() => {
+                setTaskCompletionNotificationsEnabled((prev) => !prev);
+              }}
+            />
+
+            <SettingsToggleRow
               title={i18nService.t('skipMissedJobs')}
               description={i18nService.t('skipMissedJobsDescription')}
               checked={skipMissedJobs}
@@ -2884,52 +3483,235 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
 
       case 'coworkAgentEngine':
         return (
-          <div className="space-y-6">
-            <div className="space-y-3">
-              <div className="flex items-start gap-3 rounded-xl border px-3 py-2 text-sm border-border">
-                <input
-                  type="radio"
-                  checked={true}
-                  readOnly
-                  className="mt-1"
-                />
-                <span>
-                  <span className="block font-medium text-foreground">
-                    {i18nService.t('coworkAgentEngineOpenClaw')}
-                  </span>
-                  <span className="block text-xs text-secondary">
-                    {i18nService.t('coworkAgentEngineOpenClawHint')}
-                  </span>
-                </span>
-              </div>
-            </div>
+          <div className="space-y-8 pb-2">
             {isOpenClawAgentEngine && (
-              <div className="space-y-3 rounded-xl border px-4 py-4 border-border">
-                <div className="text-xs text-secondary">
-                  {i18nService.t('coworkOpenClawInstallHint')}
-                </div>
-                <div className={`rounded-xl border px-4 py-3 text-sm ${openClawEngineStatus?.phase === 'error'
-                  ? 'border-red-300 bg-red-50 text-red-700 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300'
-                  : 'border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-300'}`}
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      {resolveOpenClawStatusText(openClawEngineStatus)}
-                      {openClawProgressPercent !== null && (
-                        <span className="ml-2 text-xs opacity-80">{openClawProgressPercent}%</span>
-                      )}
+              <>
+                <section className="space-y-3">
+                  <h4 className="text-sm font-medium text-foreground">
+                    {i18nService.t('openClawRuntimeStatusTitle')}
+                  </h4>
+
+                  <div className="rounded-xl border border-border bg-surface p-4">
+                    <div className="flex items-start gap-3.5">
+                      <span className={`inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${openClawStatusTone.iconClassName}`}>
+                        <OpenClawStatusIcon className={`h-5 w-5 ${openClawStatusTone.spinIcon ? 'animate-spin' : ''}`} />
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="min-w-0 text-sm font-medium leading-5 text-foreground">
+                            {resolveOpenClawStatusText(openClawEngineStatus)}
+                          </div>
+                          <span className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${openClawStatusTone.badgeClassName}`}>
+                            <span className={`h-1.5 w-1.5 rounded-full ${openClawStatusTone.badgeDotClassName} ${openClawStatusTone.inProgress ? 'animate-pulse' : ''}`} />
+                            {i18nService.t(openClawStatusTone.badgeLabelKey)}
+                          </span>
+                        </div>
+
+                        {openClawGatewayHttpUrl ? (
+                          <div className="mt-3 flex max-w-full items-center gap-2 rounded-lg border border-border-subtle bg-surface-raised/60 p-1.5">
+                            <span className="shrink-0 rounded-md bg-background px-2 py-1 text-[11px] font-medium text-secondary">
+                              {i18nService.t('openClawGatewayAddress')}
+                            </span>
+                            <code
+                              className="min-w-0 flex-1 select-all truncate px-1 font-mono text-[13px] leading-6 text-foreground"
+                              title={openClawGatewayHttpUrl}
+                            >
+                              {openClawGatewayHttpUrl}
+                            </code>
+                            <button
+                              type="button"
+                              onClick={handleCopyOpenClawGatewayUrl}
+                              title={openClawGatewayCopied ? i18nService.t('copied') : i18nService.t('copyToClipboard')}
+                              aria-label={openClawGatewayCopied ? i18nService.t('copied') : i18nService.t('copyToClipboard')}
+                              className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-secondary transition-colors hover:bg-background hover:text-primary focus:outline-none focus:ring-2 focus:ring-primary/25"
+                            >
+                              {openClawGatewayCopied
+                                ? <CheckCircleIcon className="h-4 w-4 text-primary" />
+                                : <MessageCopyIcon className="h-4 w-4" />}
+                            </button>
+                          </div>
+                        ) : (
+                          <p className="mt-2 text-sm text-secondary">
+                            {resolveOpenClawStatusDescription(openClawEngineStatus)}
+                          </p>
+                        )}
+
+                        {openClawStatusTone.inProgress && openClawProgressPercent !== null && (
+                          <div className="mt-3 space-y-1.5">
+                            <div className="flex items-center justify-between text-xs">
+                              <span className="text-secondary">{i18nService.t('openClawStartupProgressLabel')}</span>
+                              <span className="font-medium tabular-nums text-foreground">{openClawProgressPercent}%</span>
+                            </div>
+                            <div className="h-1.5 overflow-hidden rounded-full bg-surface-raised">
+                              <div
+                                className={`h-full rounded-full transition-all ${openClawStatusTone.progressClassName}`}
+                                style={{ width: `${openClawProgressPercent}%` }}
+                              />
+                            </div>
+                          </div>
+                        )}
+                      </div>
                     </div>
                   </div>
-                  {openClawProgressPercent !== null && (
-                    <div className="mt-2 h-2 rounded-full bg-black/10 overflow-hidden">
-                      <div
-                        className="h-full bg-primary transition-all"
-                        style={{ width: `${openClawProgressPercent}%` }}
-                      />
+                </section>
+
+                <section className="space-y-3">
+                  <h4 className="text-sm font-medium text-foreground">
+                    {i18nService.t('openClawMaintenanceTitle')}
+                  </h4>
+
+                  <div className="overflow-hidden rounded-xl border border-border bg-surface divide-y divide-border">
+                    <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex min-w-0 items-start gap-3">
+                        <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary-muted text-primary">
+                          <WrenchScrewdriverIcon className="h-[18px] w-[18px]" />
+                        </span>
+                        <div className="min-w-0">
+                          <div className="text-sm font-medium text-foreground">
+                            {i18nService.t('openClawRepairGatewayStateTitle')}
+                          </div>
+                          <div className="mt-0.5 text-[13px] leading-5 text-secondary">
+                            {i18nService.t('openClawRepairGatewayStateDesc')}
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowOpenClawRepairConfirm(true)}
+                        disabled={isRepairingOpenClaw}
+                        className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 self-start rounded-lg border border-border bg-surface px-3 text-xs font-medium text-foreground transition-colors hover:bg-surface-raised disabled:cursor-not-allowed disabled:opacity-60 active:scale-[0.98] sm:self-auto"
+                      >
+                        {isRepairingOpenClaw && (
+                          <ArrowPathIcon className="h-3.5 w-3.5 animate-spin" />
+                        )}
+                        {isRepairingOpenClaw
+                          ? i18nService.t('openClawRepairRunning')
+                          : i18nService.t('openClawRepairConfirmAction')}
+                      </button>
                     </div>
-                  )}
-                </div>
-              </div>
+
+                    {openClawDataBackupResult && (
+                      <div className="flex flex-col gap-3 p-4 text-sm sm:flex-row sm:items-center sm:justify-between">
+                        <div className="min-w-0 space-y-1">
+                          <div className="font-medium text-foreground">
+                            {i18nService.t('openClawDataBackupSavedTitle')}
+                          </div>
+                          <div className="break-all font-mono text-xs leading-5 text-secondary">
+                            {openClawDataBackupResult.path}
+                          </div>
+                          {formatBackupSize(openClawDataBackupResult.sizeBytes) && (
+                            <div className="text-xs text-secondary">
+                              {i18nService.t('openClawDataBackupSize')}: {formatBackupSize(openClawDataBackupResult.sizeBytes)}
+                            </div>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => { void handleRevealOpenClawDataBackup(); }}
+                          className="inline-flex h-8 shrink-0 items-center justify-center rounded-lg border border-border bg-surface px-3 text-xs font-medium text-foreground transition-colors hover:bg-surface-raised active:scale-[0.98]"
+                        >
+                          {i18nService.t('showInFolder')}
+                        </button>
+                      </div>
+                    )}
+
+                    <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex min-w-0 items-start gap-3">
+                        <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary-muted text-primary">
+                          <ArchiveBoxIcon className="h-[18px] w-[18px]" />
+                        </span>
+                        <div className="min-w-0">
+                          <div className="text-sm font-medium text-foreground">
+                            {i18nService.t('openClawDataBackupTitle')}
+                          </div>
+                          <div className="mt-0.5 text-[13px] leading-5 text-secondary">
+                            {i18nService.t('openClawDataBackupDesc')}
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => { void handleOpenClawDataBackup(); }}
+                        disabled={isBackingUpOpenClawData || isRestoringOpenClawData}
+                        className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 self-start rounded-lg border border-border bg-surface px-3 text-xs font-medium text-foreground transition-colors hover:bg-surface-raised disabled:cursor-not-allowed disabled:opacity-60 active:scale-[0.98] sm:self-auto"
+                      >
+                        {isBackingUpOpenClawData && (
+                          <ArrowPathIcon className="h-3.5 w-3.5 animate-spin" />
+                        )}
+                        {isBackingUpOpenClawData
+                          ? i18nService.t('openClawDataBackupRunning')
+                          : i18nService.t('openClawDataBackupAction')}
+                      </button>
+                    </div>
+
+                    <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex min-w-0 items-start gap-3">
+                        <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary-muted text-primary">
+                          <ArrowPathRoundedSquareIcon className="h-[18px] w-[18px]" />
+                        </span>
+                        <div className="min-w-0">
+                          <div className="text-sm font-medium text-foreground">
+                            {i18nService.t('openClawDataMigrationTitle')}
+                          </div>
+                          <div className="mt-0.5 text-[13px] leading-5 text-secondary">
+                            {i18nService.t('openClawDataMigrationDesc')}
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowOpenClawDataRestoreConfirm(true)}
+                        disabled={isBackingUpOpenClawData || isRestoringOpenClawData}
+                        className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 self-start rounded-lg border border-border bg-surface px-3 text-xs font-medium text-foreground transition-colors hover:bg-surface-raised disabled:cursor-not-allowed disabled:opacity-60 active:scale-[0.98] sm:self-auto"
+                      >
+                        {isRestoringOpenClawData && (
+                          <ArrowPathIcon className="h-3.5 w-3.5 animate-spin" />
+                        )}
+                        {isRestoringOpenClawData
+                          ? i18nService.t('openClawDataMigrationRunning')
+                          : i18nService.t('openClawDataMigrationAction')}
+                      </button>
+                    </div>
+                  </div>
+                </section>
+
+                {openClawRepairResult && (
+                  <div className={`rounded-lg border px-3 py-3 text-sm ${openClawRepairResult.success
+                    ? 'border-green-200 bg-green-50 text-green-700 dark:border-green-900/60 dark:bg-green-950/30 dark:text-green-300'
+                    : 'border-red-300 bg-red-50 text-red-700 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300'}`}
+                  >
+                    <div className="font-medium">
+                      {resolveOpenClawRepairMessage(openClawRepairResult)}
+                    </div>
+                    {openClawRepairResult.backupPath && (
+                      <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="min-w-0 text-xs opacity-90">
+                          <span>{i18nService.t('openClawRepairBackupPath')}: </span>
+                          <span className="font-mono break-all">{openClawRepairResult.backupPath}</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => { void handleRevealOpenClawRepairBackup(); }}
+                          className="inline-flex shrink-0 items-center justify-center rounded-lg border border-current/30 px-2.5 py-1 text-xs font-medium transition-colors hover:bg-current/10"
+                        >
+                          {i18nService.t('showInFolder')}
+                        </button>
+                      </div>
+                    )}
+                    {!openClawRepairResult.success && (
+                      <div className="mt-3">
+                        <button
+                          type="button"
+                          onClick={() => { void coworkService.restartOpenClawGateway(); }}
+                          className="inline-flex items-center justify-center rounded-lg border border-current/30 px-2.5 py-1 text-xs font-medium transition-colors hover:bg-current/10"
+                        >
+                          {i18nService.t('coworkOpenClawRestartGateway')}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </>
             )}
           </div>
         );
@@ -3146,32 +3928,90 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
 
       case 'shortcuts':
         return (
-          <div className="space-y-5">
-            <div>
-              <label className="block text-sm font-medium text-foreground mb-3">
-                {i18nService.t('keyboardShortcuts')}
-              </label>
-              <div className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-sm text-foreground">{i18nService.t('newChat')}</span>
-                  <ShortcutRecorder value={shortcuts.newChat} onChange={(v) => handleShortcutChange('newChat', v)} />
+          <div className="space-y-4">
+            <div className="relative">
+              <MagnifyingGlassIcon className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-secondary" />
+              <input
+                value={shortcutSearchQuery}
+                onChange={(event) => setShortcutSearchQuery(event.target.value)}
+                placeholder={i18nService.t('shortcutSearchPlaceholder')}
+                className="h-9 w-full rounded-xl border border-border bg-surface pl-9 pr-3 text-xs text-foreground outline-none transition-colors placeholder:text-secondary/70 focus:border-primary focus:ring-1 focus:ring-primary/25"
+              />
+            </div>
+            <p className="text-xs leading-5 text-secondary">
+              {i18nService.t('shortcutScopeHint')}
+            </p>
+            <div className="overflow-hidden rounded-xl border border-border bg-surface">
+              {filteredShortcutGroups.length > 0 ? filteredShortcutGroups.map((group, groupIndex) => (
+                <div key={group.titleKey}>
+                  <div className={`border-border-subtle bg-surface-raised/60 px-4 py-2 text-xs font-medium uppercase tracking-wide text-secondary ${
+                    groupIndex === 0 ? '' : 'border-t'
+                  }`}>
+                    {i18nService.t(group.titleKey)}
+                  </div>
+                  {group.commands.map((command, commandIndex) => {
+                    const value = shortcuts[command.key] ?? '';
+                    const commandLabel = getShortcutCommandText(command, 'labelKey');
+                    return (
+                      <div
+                        key={command.key}
+                        className={`group grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-4 py-2.5 ${
+                          commandIndex === 0 ? '' : 'border-t border-border-subtle'
+                        }`}
+                      >
+                        <div className="min-w-0">
+                          <div className="truncate text-xs font-medium text-foreground">
+                            {commandLabel}
+                          </div>
+                          <div className="mt-0.5 line-clamp-2 text-xs text-secondary">
+                            {getShortcutCommandText(command, 'descriptionKey')}
+                          </div>
+                        </div>
+                        <div className="flex items-center justify-end gap-2">
+                          {command.inputType === 'send' ? (
+                            <SendShortcutSelect
+                              value={value}
+                              onChange={(nextValue) => handleShortcutChange(command.key, nextValue)}
+                            />
+                          ) : (
+                            <ShortcutRecorder
+                              value={value}
+                              label={commandLabel}
+                              onChange={(nextValue) => handleShortcutChange(command.key, nextValue)}
+                            />
+                          )}
+                          {value ? (
+                            <button
+                              type="button"
+                              onClick={() => handleShortcutChange(command.key, '')}
+                              title={i18nService.t('shortcutClear')}
+                              aria-label={i18nService.t('shortcutClear')}
+                              className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-secondary transition-colors hover:bg-surface-raised hover:text-foreground"
+                            >
+                              <TrashIcon className="h-3.5 w-3.5" />
+                            </button>
+                          ) : (
+                            <span className="h-6 w-6 shrink-0" aria-hidden="true" />
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-sm text-foreground">{i18nService.t('search')}</span>
-                  <ShortcutRecorder value={shortcuts.search} onChange={(v) => handleShortcutChange('search', v)} />
+              )) : (
+                <div className="px-4 py-8 text-center text-sm text-secondary">
+                  {i18nService.t('shortcutNoResults')}
                 </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-sm text-foreground">{i18nService.t('openSettings')}</span>
-                  <ShortcutRecorder value={shortcuts.settings} onChange={(v) => handleShortcutChange('settings', v)} />
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-sm text-foreground">{i18nService.t('sendMessageShortcut')}</span>
-                  <SendShortcutSelect
-                    value={shortcuts.sendMessage}
-                    onChange={(v) => handleShortcutChange('sendMessage', v)}
-                  />
-                </div>
-              </div>
+              )}
+            </div>
+            <div className="flex justify-end">
+              <button
+                type="button"
+                onClick={handleResetShortcuts}
+                className="rounded-xl bg-surface-raised px-4 py-2 text-xs font-medium text-foreground transition-colors hover:bg-border/60"
+              >
+                {i18nService.t('shortcutResetAll')}
+              </button>
             </div>
           </div>
         );
@@ -3180,7 +4020,11 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
         return <IMSettings />;
 
       case 'plugins':
-        return <PluginsSettings />;
+        return (
+          <PluginsSettings
+            handleRef={pluginsSettingsRef}
+          />
+        );
 
       case 'about':
         return (
@@ -3190,7 +4034,9 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
               src="logo.png"
               alt="LobsterAI"
               className="w-16 h-16 mb-3 cursor-pointer select-none"
-              onClick={() => {
+              onClick={(e) => {
+                if (!e.altKey || !e.shiftKey) return;
+
                 const next = logoClickCount + 1;
                 setLogoClickCount(next);
                 if (next >= 10 && !testModeUnlocked) {
@@ -3203,9 +4049,9 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
 
             {/* Info Card */}
             <div className="w-full mt-8 rounded-xl border border-border overflow-hidden">
-              <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-                <span className="text-sm text-foreground">{i18nService.t('aboutVersion')}</span>
-                <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-3 border-b border-border">
+                <span className="shrink-0 text-sm text-foreground">{i18nService.t('aboutVersion')}</span>
+                <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
                   <span className="text-sm text-secondary">{appVersion}</span>
                   {!enterpriseConfig?.disableUpdate && (
                   <button
@@ -3227,9 +4073,9 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
                   )}
                 </div>
               </div>
-              <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-                <span className="text-sm text-foreground">{i18nService.t('aboutContactEmail')}</span>
-                <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-3 border-b border-border">
+                <span className="shrink-0 text-sm text-foreground">{i18nService.t('aboutContactEmail')}</span>
+                <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
                   <button
                     type="button"
                     onClick={(e) => {
@@ -3237,7 +4083,7 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
                       void handleCopyContactEmail();
                     }}
                     title={i18nService.t('copyToClipboard')}
-                    className="text-sm text-secondary bg-transparent border-none appearance-none p-0 m-0 cursor-pointer focus:outline-none"
+                    className="min-w-0 break-all text-right text-sm text-secondary bg-transparent border-none appearance-none p-0 m-0 cursor-pointer focus:outline-none"
                   >
                     {ABOUT_CONTACT_EMAIL}
                   </button>
@@ -3248,35 +4094,35 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
                   )}
                 </div>
               </div>
-              <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-                <span className="text-sm text-foreground">{i18nService.t('aboutUserManual')}</span>
+              <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-3 border-b border-border">
+                <span className="shrink-0 text-sm text-foreground">{i18nService.t('aboutUserManual')}</span>
                 <button
                   type="button"
                   onClick={(e) => {
                     e.stopPropagation();
                     handleOpenUserManual();
                   }}
-                  className="text-sm text-secondary hover:text-primary dark:hover:text-primary bg-transparent border-none appearance-none px-1.5 py-0.5 -mx-1.5 -my-0.5 rounded-md cursor-pointer focus:outline-none hover:bg-surface-raised transition-colors"
+                  className="min-w-0 break-all text-right text-sm text-secondary hover:text-primary dark:hover:text-primary bg-transparent border-none appearance-none px-1.5 py-0.5 -mx-1.5 -my-0.5 rounded-md cursor-pointer focus:outline-none hover:bg-surface-raised transition-colors"
                 >
                   {ABOUT_USER_MANUAL_URL}
                 </button>
               </div>
-              <div className={`flex items-center justify-between px-4 py-3${testModeUnlocked ? ' border-b border-border' : ''}`}>
-                <span className="text-sm text-foreground">{i18nService.t('aboutUserCommunity')}</span>
+              <div className={`flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-3${testModeUnlocked ? ' border-b border-border' : ''}`}>
+                <span className="shrink-0 text-sm text-foreground">{i18nService.t('aboutUserCommunity')}</span>
                 <button
                   type="button"
                   onClick={(e) => {
                     e.stopPropagation();
                     handleOpenUserCommunity();
                   }}
-                  className="text-sm text-secondary hover:text-primary dark:hover:text-primary bg-transparent border-none appearance-none px-1.5 py-0.5 -mx-1.5 -my-0.5 rounded-md cursor-pointer focus:outline-none hover:bg-surface-raised transition-colors"
+                  className="min-w-0 break-all text-right text-sm text-secondary hover:text-primary dark:hover:text-primary bg-transparent border-none appearance-none px-1.5 py-0.5 -mx-1.5 -my-0.5 rounded-md cursor-pointer focus:outline-none hover:bg-surface-raised transition-colors"
                 >
                   {ABOUT_USER_COMMUNITY_URL}
                 </button>
               </div>
               {testModeUnlocked && (
-                <div className="flex items-center justify-between px-4 py-3">
-                  <span className="text-sm text-foreground">{i18nService.t('testMode')}</span>
+                <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-3">
+                  <span className="shrink-0 text-sm text-foreground">{i18nService.t('testMode')}</span>
                   <button
                     type="button"
                     role="switch"
@@ -3298,7 +4144,7 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
 
             {/* Footer */}
             <div className="mt-auto w-full pt-14 pb-2 flex flex-col items-center">
-              <div className="flex items-center justify-center text-sm text-secondary">
+              <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-2 text-sm text-secondary">
                 <button
                   type="button"
                   onClick={(e) => {
@@ -3309,7 +4155,7 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
                 >
                   {i18nService.t('aboutServiceTerms')}
                 </button>
-                <span className="mx-3 text-xs opacity-40">|</span>
+                <span className="text-xs opacity-40">|</span>
                 <button
                   type="button"
                   onClick={(e) => {
@@ -3323,10 +4169,10 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
                 </button>
               </div>
 
-              <p className="mt-5 text-xs text-secondary">
+              <p className="mt-5 text-center text-xs text-secondary">
                 {i18nService.t('copyrightHolder')}
               </p>
-              <p className="mt-1 text-xs text-secondary">
+              <p className="mt-1 text-center text-xs text-secondary">
                 Copyright &copy; {new Date().getFullYear()} NetEase Youdao. All Rights Reserved.
               </p>
             </div>
@@ -3339,9 +4185,13 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
   };
 
   return (
-    <Modal onClose={onClose} overlayClassName="fixed inset-0 z-50 modal-backdrop flex items-center justify-center">
+    <Modal
+      onClose={guardedClose}
+      overlayClassName="fixed inset-0 z-50 modal-backdrop flex items-center justify-center p-3 sm:p-4"
+      className="w-[calc(100vw-1.5rem)] max-w-[900px] min-w-0 sm:w-[calc(100vw-2rem)]"
+    >
       <div
-        className="relative flex w-[900px] h-[80vh] rounded-2xl border-border border shadow-modal overflow-hidden modal-content"
+        className="relative flex h-[80vh] max-h-[calc(100vh-2rem)] w-full min-w-0 rounded-2xl border-border border shadow-modal overflow-hidden modal-content"
         onClick={handleSettingsClick}
       >
         {/* Left sidebar */}
@@ -3360,8 +4210,8 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
                     : 'text-secondary hover:text-foreground hover:bg-surface-raised'
                 }`}
               >
-                {tab.icon}
-                <span>{tab.label}</span>
+                <span className="shrink-0">{tab.icon}</span>
+                <span className="min-w-0 truncate">{tab.label}</span>
               </button>
             ))}
           </nav>
@@ -3370,10 +4220,10 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
         {/* Right content */}
         <div className="relative flex-1 flex flex-col min-w-0 overflow-hidden bg-background rounded-r-2xl">
           {/* Content header */}
-          <div className="flex justify-between items-center px-6 pt-5 pb-3 shrink-0">
-            <h3 className="text-lg font-semibold text-foreground">{activeTabLabel}</h3>
+          <div className="flex justify-between items-center gap-3 px-6 pt-5 pb-3 shrink-0">
+            <h3 className="min-w-0 truncate text-lg font-semibold text-foreground">{activeTabLabel}</h3>
             <button
-              onClick={onClose}
+              onClick={guardedClose}
               className="text-secondary hover:text-foreground p-1.5 hover:bg-surface-raised rounded-lg transition-colors"
             >
               <XMarkIcon className="h-5 w-5" />
@@ -3412,7 +4262,7 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
             <div className="flex justify-end space-x-4 p-4 border-border border-t bg-background shrink-0">
               <button
                 type="button"
-                onClick={onClose}
+                onClick={guardedClose}
                 className="px-4 py-2 rounded-xl transition-colors text-sm font-medium border border-border text-foreground hover:bg-surface-raised active:scale-[0.98]"
               >
                 {i18nService.t('cancel')}
@@ -3449,6 +4299,140 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
           handleCancelModelEdit={handleCancelModelEdit}
           handleModelDialogKeyDown={handleModelDialogKeyDown}
         />
+
+          {showOpenClawRepairConfirm && (
+            <div
+              className="absolute inset-0 z-30 flex items-center justify-center bg-black/35 px-4 rounded-2xl"
+              onClick={() => {
+                if (!isRepairingOpenClaw) setShowOpenClawRepairConfirm(false);
+              }}
+            >
+              <div
+                className="bg-surface border-border border rounded-2xl shadow-xl w-full max-w-md"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="px-5 pt-5 pb-4 border-b border-border">
+                  <div className="flex items-center gap-3">
+                    <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary-muted text-primary">
+                      <WrenchScrewdriverIcon className="h-5 w-5" />
+                    </span>
+                    <h3 className="text-base font-semibold text-foreground">
+                      {i18nService.t('openClawRepairConfirmTitle')}
+                    </h3>
+                  </div>
+                </div>
+
+                <div className="space-y-3 px-5 py-4 text-sm text-secondary">
+                  <p>{i18nService.t('openClawRepairConfirmDesc')}</p>
+                  <p>{i18nService.t('openClawRepairConfirmSafeDesc')}</p>
+                </div>
+
+                <div className="flex justify-end space-x-2 px-5 pb-5">
+                  <button
+                    type="button"
+                    onClick={() => setShowOpenClawRepairConfirm(false)}
+                    disabled={isRepairingOpenClaw}
+                    className="px-3 py-1.5 text-sm text-foreground hover:bg-surface-raised rounded-xl border border-border disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {i18nService.t('cancel')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { void handleConfirmOpenClawRepair(); }}
+                    disabled={isRepairingOpenClaw}
+                    className="inline-flex items-center justify-center gap-2 px-3 py-1.5 text-sm text-white bg-primary hover:bg-primary-hover rounded-xl disabled:opacity-60 disabled:cursor-not-allowed transition-colors active:scale-[0.98]"
+                  >
+                    <WrenchScrewdriverIcon className="h-4 w-4" />
+                    {isRepairingOpenClaw
+                      ? i18nService.t('openClawRepairRunning')
+                      : i18nService.t('openClawRepairConfirmAction')}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {showOpenClawDataRestoreConfirm && (
+            <div
+              className="absolute inset-0 z-30 flex items-center justify-center bg-black/35 px-4 rounded-2xl"
+              onClick={() => {
+                if (!isRestoringOpenClawData) setShowOpenClawDataRestoreConfirm(false);
+              }}
+            >
+              <div
+                className="bg-surface border-border border rounded-2xl shadow-xl w-full max-w-md"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="px-5 pt-5 pb-4 border-b border-border">
+                  <div className="flex items-center gap-3">
+                    <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary-muted text-primary">
+                      <ArrowPathRoundedSquareIcon className="h-5 w-5" />
+                    </span>
+                    <h3 className="text-base font-semibold text-foreground">
+                      {i18nService.t('openClawDataMigrationConfirmTitle')}
+                    </h3>
+                  </div>
+                </div>
+
+                <div className="space-y-3 px-5 py-4 text-sm text-secondary">
+                  <p>{i18nService.t('openClawDataMigrationConfirmDesc')}</p>
+                  <p>{i18nService.t('openClawDataMigrationConfirmSafeDesc')}</p>
+                </div>
+
+                <div className="flex justify-end space-x-2 px-5 pb-5">
+                  <button
+                    type="button"
+                    onClick={() => setShowOpenClawDataRestoreConfirm(false)}
+                    disabled={isRestoringOpenClawData}
+                    className="px-3 py-1.5 text-sm text-foreground hover:bg-surface-raised rounded-xl border border-border disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {i18nService.t('cancel')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { void handleConfirmOpenClawDataRestore(); }}
+                    disabled={isRestoringOpenClawData}
+                    className="inline-flex items-center justify-center gap-2 px-3 py-1.5 text-sm text-white bg-primary hover:bg-primary-hover rounded-xl disabled:opacity-60 disabled:cursor-not-allowed transition-colors active:scale-[0.98]"
+                  >
+                    {isRestoringOpenClawData
+                      ? <ArrowPathIcon className="h-4 w-4 animate-spin" />
+                      : <ArrowPathRoundedSquareIcon className="h-4 w-4" />}
+                    {isRestoringOpenClawData
+                      ? i18nService.t('openClawDataMigrationRunning')
+                      : i18nService.t('openClawDataMigrationConfirmAction')}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {(isBackingUpOpenClawData || isRestoringOpenClawData) && (
+            <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/45 px-4">
+              <div className="w-full max-w-md rounded-2xl border border-border bg-surface px-5 py-5 text-center shadow-xl">
+                <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-full bg-primary-muted text-primary">
+                  <ArrowPathIcon className="h-5 w-5 animate-spin" />
+                </div>
+                <h3 className="mt-4 text-base font-semibold text-foreground">
+                  {i18nService.t(isBackingUpOpenClawData
+                    ? 'openClawDataBackupBlockingTitle'
+                    : 'openClawDataMigrationBlockingTitle')}
+                </h3>
+                <p className="mt-2 text-sm leading-6 text-secondary">
+                  {i18nService.t(isBackingUpOpenClawData
+                    ? 'openClawDataBackupBlockingDesc'
+                    : 'openClawDataMigrationBlockingDesc')}
+                </p>
+                <div className="mt-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-left text-xs leading-5 text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
+                  <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>
+                    {i18nService.t(isBackingUpOpenClawData
+                      ? 'openClawDataBackupBlockingWarning'
+                      : 'openClawDataMigrationBlockingWarning')}
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Memory Modal */}
           {showMemoryModal && (
@@ -3504,6 +4488,7 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, notice
               </div>
             </div>
           )}
+
       </div>
     </Modal>
   );

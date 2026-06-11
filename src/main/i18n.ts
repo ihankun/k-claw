@@ -19,8 +19,13 @@ const translations: Record<LanguageType, Record<string, string>> = {
     // Tray menu
     trayShowWindow: '打开 LobsterAI',
     trayNewTask: '新建任务',
+    trayViewCompletedTask: '查看完成的任务',
+    trayCompletedTaskTooltip: 'LobsterAI - {count} 个任务已完成',
     traySettings: '设置',
     trayQuit: '退出',
+    taskCompletionNotificationTitle: '任务已完成',
+    taskCompletionNotificationBody: '有任务已完成，点击查看结果',
+    taskCompletionOverlayDescription: '有任务已完成',
 
     // Session titles (created by ChannelSessionSync)
     coworkDefaultSessionTitle: '新对话',
@@ -50,10 +55,15 @@ const translations: Record<LanguageType, Record<string, string>> = {
 
     // Cowork error messages (shared with renderer via classifyErrorKey)
     coworkErrorAuthInvalid: 'API 密钥无效或已过期，请检查配置。',
+    coworkErrorFreeQuotaExhausted:
+      '当前模型的免费额度已用完，升级套餐后可继续使用。\n\n[立即升级](https://c.youdao.com/dict/hardware/octopus/lobsterai-portal.html)',
     coworkErrorInsufficientBalance: 'API 余额不足，请充值后重试。',
     coworkErrorInputTooLong: '输入内容过长，超出模型上下文限制。',
+    coworkErrorMessageTooLarge:
+      '本次消息过大，请减少附件、压缩图片或拆分提交。（单次整体需小于 30MB）',
     coworkErrorCouldNotProcessPdf: '无法处理 PDF 文件。',
     coworkErrorModelNotFound: '请求的模型不存在或不可用。',
+    coworkGatewaySessionSyncTimeout: 'OpenClaw 会话同步超时，消息尚未发送。请稍后重试或重启 OpenClaw Runtime。',
     coworkErrorGatewayDisconnected: 'AI 引擎连接中断，请重试。',
     coworkErrorServiceRestart: 'AI 引擎正在重启，请稍后重试。',
     coworkErrorGatewayDraining: 'AI 引擎正在重启中，请稍等片刻后重试。',
@@ -62,6 +72,10 @@ const translations: Record<LanguageType, Record<string, string>> = {
     coworkErrorContentFiltered: '内容未通过安全审核，请修改后重试。',
     coworkErrorServerError: '服务端出现错误，请稍后重试。',
     coworkErrorEngineNotReady: 'AI 引擎正在启动中，请稍等几秒后重试。',
+    coworkErrorModelStreamEmptySseData:
+      '模型流式响应格式异常：模型服务返回了空的 SSE data 帧。请稍后重试，或检查当前模型代理配置。',
+    coworkErrorModelStreamOnlyEmptySseData:
+      '模型流式响应一直为空：模型服务连续返回空的 SSE data 帧。请稍后重试，或检查当前模型代理配置。',
     coworkErrorUnknown: '任务执行出错，请重试。如果问题持续出现，请检查模型配置。',
     imErrorPrefix: '处理消息时出错',
 
@@ -79,6 +93,17 @@ const translations: Record<LanguageType, Record<string, string>> = {
     // Auth quota
     authPlanFree: '免费',
     authPlanStandard: '标准',
+
+    // Data migration dialogs
+    dataMigrationBackupDialogTitle: '备份 LobsterAI 数据',
+    dataMigrationRestoreDialogTitle: '导入 LobsterAI 数据备份',
+    dataMigrationBackupArchiveFilter: 'LobsterAI 备份包',
+    dataMigrationAllFilesFilter: '所有文件',
+    dataMigrationBackupBlockedByActiveWorkloads:
+      '当前有正在运行的 Agent 或定时任务，请停止或等待任务完成后再备份。',
+    dataMigrationRestoreProgressTitle: '正在导入 LobsterAI 数据',
+    dataMigrationRestoreProgressDesc: '正在恢复备份并校验数据，完成后应用会自动重启。',
+    dataMigrationRestoreProgressWarning: '请不要关闭应用或重启电脑，否则可能中断本次数据迁移。',
 
     // ── IM connectivity test messages ───────────────────────────────────
     // Common
@@ -265,8 +290,13 @@ const translations: Record<LanguageType, Record<string, string>> = {
     // Tray menu
     trayShowWindow: 'Open LobsterAI',
     trayNewTask: 'New Task',
+    trayViewCompletedTask: 'View Completed Task',
+    trayCompletedTaskTooltip: 'LobsterAI - {count} completed task(s)',
     traySettings: 'Settings',
     trayQuit: 'Quit',
+    taskCompletionNotificationTitle: 'Task Complete',
+    taskCompletionNotificationBody: 'A task has finished. Click to view the result.',
+    taskCompletionOverlayDescription: 'Task complete',
 
     // Session titles
     coworkDefaultSessionTitle: 'New Chat',
@@ -306,10 +336,15 @@ const translations: Record<LanguageType, Record<string, string>> = {
 
     // Cowork error messages
     coworkErrorAuthInvalid: 'Invalid or expired API key. Please check your configuration.',
+    coworkErrorFreeQuotaExhausted:
+      'The current model\'s free quota has been used up. Upgrade your plan to continue.\n\n[Upgrade now](https://c.youdao.com/dict/hardware/octopus/lobsterai-portal.html)',
     coworkErrorInsufficientBalance: 'Insufficient API balance. Please top up and try again.',
     coworkErrorInputTooLong: 'Input too long, exceeding model context limit.',
+    coworkErrorMessageTooLarge:
+      'This message is too large. Reduce attachments, compress images, or split it up. (Keep each message under about 30 MB.)',
     coworkErrorCouldNotProcessPdf: 'Unable to process the PDF file.',
     coworkErrorModelNotFound: 'The requested model does not exist or is unavailable.',
+    coworkGatewaySessionSyncTimeout: 'OpenClaw session sync timed out, and the message was not sent. Please retry later or restart OpenClaw Runtime.',
     coworkErrorGatewayDisconnected: 'AI engine connection lost. Please retry.',
     coworkErrorServiceRestart: 'AI engine is restarting. Please try again later.',
     coworkErrorGatewayDraining: 'AI engine is restarting. Please wait a moment and try again.',
@@ -319,6 +354,10 @@ const translations: Record<LanguageType, Record<string, string>> = {
       'Content did not pass the safety review. Please modify and try again.',
     coworkErrorServerError: 'Server error occurred. Please try again later.',
     coworkErrorEngineNotReady: 'AI engine is starting up. Please wait a few seconds and try again.',
+    coworkErrorModelStreamEmptySseData:
+      'Model stream format error: the model service returned an empty SSE data frame. Please retry later or check the current model proxy configuration.',
+    coworkErrorModelStreamOnlyEmptySseData:
+      'Model stream stayed empty: the model service kept returning empty SSE data frames. Please retry later or check the current model proxy configuration.',
     coworkErrorUnknown:
       'Task failed due to an unexpected error. Please retry. If the issue persists, check your model configuration.',
     imErrorPrefix: 'Error processing message',
@@ -338,6 +377,19 @@ const translations: Record<LanguageType, Record<string, string>> = {
     // Auth quota
     authPlanFree: 'Free',
     authPlanStandard: 'Standard',
+
+    // Data migration dialogs
+    dataMigrationBackupDialogTitle: 'Back Up LobsterAI Data',
+    dataMigrationRestoreDialogTitle: 'Import LobsterAI Data Backup',
+    dataMigrationBackupArchiveFilter: 'LobsterAI Backup',
+    dataMigrationAllFilesFilter: 'All Files',
+    dataMigrationBackupBlockedByActiveWorkloads:
+      'An agent or scheduled task is still running. Stop it or wait for it to finish before backing up.',
+    dataMigrationRestoreProgressTitle: 'Importing LobsterAI data',
+    dataMigrationRestoreProgressDesc:
+      'Restoring the backup and validating data. LobsterAI will restart automatically when finished.',
+    dataMigrationRestoreProgressWarning:
+      'Do not close the app or restart the computer, or the migration may be interrupted.',
 
     // ── IM connectivity test messages ───────────────────────────────────
     // Common

@@ -7,6 +7,7 @@ import net from 'net';
 import os from 'os';
 import path from 'path';
 
+import type { OpenClawEnginePhase } from '../../shared/openclawEngine/constants';
 import { ensureElectronNodeShim, getElectronNodeRuntimePath, getSkillsRoot } from './coworkUtil';
 import {
   formatGatewayLogDateKey,
@@ -38,19 +39,15 @@ const GATEWAY_BOOT_TIMEOUT_MS = 300 * 1000;
 const GATEWAY_MAX_RESTART_ATTEMPTS = 5;
 const GATEWAY_RESTART_DELAYS = [3_000, 5_000, 10_000, 20_000, 30_000];
 
-export type OpenClawEnginePhase =
-  | 'not_installed'
-  | 'installing'
-  | 'ready'
-  | 'starting'
-  | 'running'
-  | 'error';
+export type { OpenClawEnginePhase } from '../../shared/openclawEngine/constants';
 
 export interface OpenClawEngineStatus {
   phase: OpenClawEnginePhase;
   version: string | null;
   progressPercent?: number;
   message?: string;
+  gatewayPort?: number | null;
+  gatewayHttpUrl?: string | null;
   canRetry: boolean;
 }
 
@@ -240,7 +237,7 @@ export class OpenClawEngineManager extends EventEmitter {
   }
 
   getStatus(): OpenClawEngineStatus {
-    return { ...this.status };
+    return this.withGatewayStatusFields(this.status);
   }
 
   setExternalError(message: string): OpenClawEngineStatus {
@@ -408,6 +405,7 @@ export class OpenClawEngineManager extends EventEmitter {
         const healthy = await this.isGatewayHealthy(port);
         console.log(`[OpenClaw] startGateway: existing process health check (${elapsed()}), healthy=${healthy}`);
         if (healthy) {
+          this.gatewayPort = port;
           if (this.status.phase !== 'running') {
             this.setStatus({
               phase: 'running',
@@ -543,7 +541,7 @@ export class OpenClawEngineManager extends EventEmitter {
     // The shims wrap Electron as a Node.js runtime via ELECTRON_RUN_AS_NODE=1.
     const npmBinDir = app.isPackaged
       ? path.join(process.resourcesPath, 'app.asar.unpacked', 'node_modules', 'npm', 'bin')
-      : undefined;
+      : path.join(app.getAppPath(), 'node_modules', 'npm', 'bin');
     const nodeShimDir = ensureElectronNodeShim(electronNodeRuntimePath, npmBinDir);
     if (nodeShimDir) {
       const curPath = env.PATH || env.Path || '';
@@ -666,6 +664,26 @@ export class OpenClawEngineManager extends EventEmitter {
     this.gatewayRestartAttempt = 0;
     console.log(`${gwDiagTs()} restartGateway: starting gateway with new env...`);
     return this.startGateway(`restart:${reason}`);
+  }
+
+  private buildGatewayHttpUrl(port: number | null): string | null {
+    return port ? `http://localhost:${port}/` : null;
+  }
+
+  private resolveStatusGatewayPort(phase: OpenClawEnginePhase): number | null {
+    if (phase !== 'running' && phase !== 'starting') {
+      return null;
+    }
+    return this.gatewayPort ?? this.readGatewayPort();
+  }
+
+  private withGatewayStatusFields(status: OpenClawEngineStatus): OpenClawEngineStatus {
+    const port = status.gatewayPort ?? this.resolveStatusGatewayPort(status.phase);
+    return {
+      ...status,
+      gatewayPort: port,
+      gatewayHttpUrl: this.buildGatewayHttpUrl(port),
+    };
   }
 
   private resolveRuntimeMetadata(): RuntimeMetadata {

@@ -7,6 +7,7 @@ import { useDispatch } from 'react-redux';
 import { i18nService } from '@/services/i18n';
 import { openArtifactPreviewTab } from '@/store/slices/artifactSlice';
 import { type Artifact, type ArtifactType, ArtifactTypeValue } from '@/types/artifact';
+import { revealLocalPathWithToast, showShellFailureToast } from '@/utils/localFileActions';
 
 const t = (key: string) => i18nService.t(key);
 
@@ -69,6 +70,13 @@ const DocumentIcon: React.FC<{ className?: string }> = ({ className }) => (
   </svg>
 );
 
+const VideoIcon: React.FC<{ className?: string }> = ({ className }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="2" y="4" width="20" height="16" rx="2" />
+    <polygon points="10 9 16 12 10 15" />
+  </svg>
+);
+
 const AppIcon: React.FC<{ className?: string }> = ({ className }) => (
   <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
     <rect x="3" y="3" width="18" height="18" rx="4" />
@@ -81,6 +89,7 @@ const TYPE_ICON_MAP: Record<ArtifactType, React.FC<{ className?: string }>> = {
   html: GlobeIcon,
   svg: SvgIcon,
   image: ImageIcon,
+  video: VideoIcon,
   mermaid: MermaidIcon,
   code: GlobeIcon,
   markdown: MarkdownIcon,
@@ -95,6 +104,7 @@ const TYPE_LABEL_KEY: Record<ArtifactType, string> = {
   html: 'artifactTypeHtml',
   svg: 'artifactTypeSvg',
   image: 'artifactTypeImage',
+  video: 'artifactTypeVideo',
   mermaid: 'artifactTypeMermaid',
   code: 'artifactTypeHtml',
   markdown: 'artifactTypeMarkdown',
@@ -195,21 +205,35 @@ const OpenDropdown: React.FC<OpenDropdownProps> = ({ anchorRef, filePath, onClos
     };
   }, [anchorRef, onClose]);
 
-  const handleOpenWithSpecificApp = useCallback((appPath: string) => {
+  const handleOpenWithSpecificApp = useCallback(async (appPath: string) => {
     const normalized = normalizeFilePath(filePath);
-    window.electron?.shell?.openPathWithApp(normalized, appPath);
+    try {
+      const result = await window.electron?.shell?.openPathWithApp(normalized, appPath);
+      if (!result?.success) {
+        showShellFailureToast(result, 'openFileFailed');
+      }
+    } catch {
+      showShellFailureToast(null, 'openFileFailed');
+    }
     onClose();
   }, [filePath, onClose]);
 
-  const handleOpenWithDefault = useCallback(() => {
+  const handleOpenWithDefault = useCallback(async () => {
     const normalized = normalizeFilePath(filePath);
-    window.electron?.shell?.openPath(normalized);
+    try {
+      const result = await window.electron?.shell?.openPath(normalized);
+      if (!result?.success) {
+        showShellFailureToast(result, 'openFileFailed');
+      }
+    } catch {
+      showShellFailureToast(null, 'openFileFailed');
+    }
     onClose();
   }, [filePath, onClose]);
 
-  const handleRevealInFolder = useCallback(() => {
+  const handleRevealInFolder = useCallback(async () => {
     const normalized = normalizeFilePath(filePath);
-    window.electron?.shell?.showItemInFolder(normalized);
+    await revealLocalPathWithToast(normalized);
     onClose();
   }, [filePath, onClose]);
 
@@ -272,9 +296,14 @@ const OpenDropdown: React.FC<OpenDropdownProps> = ({ anchorRef, filePath, onClos
 interface ArtifactPreviewCardProps {
   artifact: Artifact;
   onOpenLocalService?: (artifact: Artifact) => void;
+  onOpenHtmlFile?: (artifact: Artifact) => void;
 }
 
-const ArtifactPreviewCard: React.FC<ArtifactPreviewCardProps> = ({ artifact, onOpenLocalService }) => {
+const ArtifactPreviewCard: React.FC<ArtifactPreviewCardProps> = ({
+  artifact,
+  onOpenLocalService,
+  onOpenHtmlFile,
+}) => {
   const dispatch = useDispatch();
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const dropdownAnchorRef = useRef<HTMLButtonElement>(null);
@@ -282,6 +311,10 @@ const ArtifactPreviewCard: React.FC<ArtifactPreviewCardProps> = ({ artifact, onO
   const handleClick = () => {
     if (artifact.type === ArtifactTypeValue.LocalService && onOpenLocalService) {
       onOpenLocalService(artifact);
+      return;
+    }
+    if (artifact.type === ArtifactTypeValue.Html && artifact.filePath && onOpenHtmlFile) {
+      onOpenHtmlFile(artifact);
       return;
     }
     dispatch(openArtifactPreviewTab({ sessionId: artifact.sessionId, artifactId: artifact.id }));

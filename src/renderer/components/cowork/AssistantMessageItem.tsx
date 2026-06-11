@@ -1,9 +1,11 @@
 import React, { useCallback, useState } from 'react';
 
+import { copyTextToClipboard } from '../../services/clipboard';
 import { i18nService } from '../../services/i18n';
 import type { CoworkMessage, CoworkMessageMetadata } from '../../types/cowork';
 import { formatMessageDateTime } from '../../utils/tokenFormat';
 import MessageCopyIcon from '../icons/MessageCopyIcon';
+import MessageForkIcon from '../icons/MessageForkIcon';
 import MarkdownContent from '../MarkdownContent';
 import ImagePreviewModal, { type ImagePreviewSource } from './ImagePreviewModal';
 import {
@@ -22,17 +24,16 @@ const CopyButton: React.FC<{
 
   const handleCopy = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    try {
-      await navigator.clipboard.writeText(content);
+    const copiedToClipboard = await copyTextToClipboard(content);
+    if (copiedToClipboard) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      console.error('Failed to copy:', err);
     }
   };
 
   return (
     <button
+      type="button"
       onClick={handleCopy}
       className={`p-1.5 rounded-md hover:bg-surface-raised transition-all duration-200 ${
         visible ? 'opacity-100' : 'opacity-0 pointer-events-none'
@@ -66,6 +67,27 @@ const CopyButton: React.FC<{
 
 export { CopyButton };
 
+const ForkButton: React.FC<{
+  visible: boolean;
+  onFork: () => void;
+}> = ({ visible, onFork }) => (
+  <button
+    type="button"
+    onClick={(event) => {
+      event.stopPropagation();
+      onFork();
+    }}
+    className={`p-1.5 rounded-md hover:bg-surface-raised transition-all duration-200 ${
+      visible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+    }`}
+    tabIndex={visible ? 0 : -1}
+    title={i18nService.t('coworkForkFromMessage')}
+    aria-label={i18nService.t('coworkForkFromMessage')}
+  >
+    <MessageForkIcon className="w-4 h-4 text-[var(--icon-secondary)]" />
+  </button>
+);
+
 // ── AssistantMessageItem ─────────────────────────────────────────────────────
 
 const AssistantMessageItem: React.FC<{
@@ -73,12 +95,14 @@ const AssistantMessageItem: React.FC<{
   resolveLocalFilePath?: (href: string, text: string) => string | null;
   mapDisplayText?: (value: string) => string;
   showCopyButton?: boolean;
+  onFork?: (messageId: string) => void;
   turnMetadata?: CoworkMessageMetadata | null;
 }> = ({
   message,
   resolveLocalFilePath,
   mapDisplayText,
   showCopyButton = false,
+  onFork,
   turnMetadata,
 }) => {
   const [isHovered, setIsHovered] = useState(false);
@@ -101,6 +125,7 @@ const AssistantMessageItem: React.FC<{
   return (
     <div
       className="relative focus:outline-none"
+      data-cowork-assistant-message-id={message.id}
       tabIndex={showCopyButton ? 0 : undefined}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={handleMouseLeave}
@@ -120,6 +145,12 @@ const AssistantMessageItem: React.FC<{
         <div className={messageMetaClassName(isHovered)} aria-hidden={!isHovered}>
           <span>{formatMessageDateTime(message.timestamp)}</span>
           {modelLabel && <span>{modelLabel}</span>}
+          {onFork && (
+            <ForkButton
+              visible={isHovered}
+              onFork={() => onFork(message.id)}
+            />
+          )}
           <CopyButton
             content={displayContent}
             visible={isHovered}

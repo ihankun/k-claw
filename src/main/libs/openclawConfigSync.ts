@@ -12,6 +12,7 @@ import {
   normalizeBrowserHostnamePolicyList,
   normalizeBrowserWebAccessConfig,
 } from '../../shared/browserWebAccess/constants';
+import { normalizeMcpServerUrlInput } from '../../shared/mcp/url';
 import {
   AuthType,
   OpenClawApi as OpenClawApiConst,
@@ -43,6 +44,7 @@ import {
   resolveQualifiedAgentModelRef,
 } from './openclawAgentModels';
 import { parseChannelSessionKey } from './openclawChannelSessionSync';
+import { OpenClawConfigImpact } from './openclawConfigImpact';
 import type { OpenClawEngineManager } from './openclawEngineManager';
 import { getMainAgentWorkspacePath, readBootstrapFile } from './openclawMemoryFile';
 
@@ -60,6 +62,7 @@ import { isSystemProxyEnabled } from './systemProxy';
 
 export type AskUserCallbackConfig = {
   callbackUrl: string;
+  mediaCallbackUrl: string;
   secret: string;
 };
 
@@ -194,6 +197,19 @@ const MANAGED_OWNER_ALLOW_FROM = [
 ];
 
 const MANAGED_TOOL_DENY = ['web_search'] as const;
+const MANAGED_TOOL_LOOP_DETECTION = {
+  enabled: true,
+  historySize: 40,
+  warningThreshold: 6,
+  unknownToolThreshold: 6,
+  criticalThreshold: 10,
+  globalCircuitBreakerThreshold: 16,
+  detectors: {
+    genericRepeat: true,
+    knownPollNoProgress: true,
+    pingPong: true,
+  },
+} as const;
 const EMAIL_PLUGIN_ID = 'email';
 const NIM_CHANNEL_PLUGIN_ID = 'nimsuite-openclaw-nim-channel';
 
@@ -817,6 +833,11 @@ export const buildProviderSelection = (options: {
   const reasoning = descriptor.resolveModelReasoning
     ? descriptor.resolveModelReasoning(options.modelId, !!options.codingPlanEnabled)
     : descriptor.modelDefaults?.reasoning;
+  const contextWindow = ProviderRegistry.resolveModelContextWindow(
+    providerName,
+    options.modelId,
+    options.contextWindow,
+  ) ?? descriptor.modelDefaults?.contextWindow;
   const request = shouldUseEnvProxyForProviderBaseUrl(baseUrl)
     ? { proxy: { mode: 'env-proxy' as const } }
     : undefined;
@@ -845,9 +866,7 @@ export const buildProviderSelection = (options: {
           input: modelInput,
           ...(reasoning !== undefined ? { reasoning } : {}),
           ...(descriptor.modelDefaults?.cost ? { cost: descriptor.modelDefaults.cost } : {}),
-          ...((options.contextWindow ?? descriptor.modelDefaults?.contextWindow) !== undefined
-            ? { contextWindow: options.contextWindow ?? descriptor.modelDefaults!.contextWindow }
-            : {}),
+          ...(contextWindow !== undefined ? { contextWindow } : {}),
           ...(descriptor.modelDefaults?.maxTokens
             ? { maxTokens: descriptor.modelDefaults.maxTokens }
             : {}),
@@ -1007,6 +1026,16 @@ function buildOpenClawMcpServers(
   const result: Record<string, Record<string, unknown>> = {};
   for (const server of servers) {
     const entry: Record<string, unknown> = {};
+    let normalizedRemoteUrl = '';
+    if (server.transportType !== 'stdio') {
+      const normalizedUrl = normalizeMcpServerUrlInput(server.url);
+      if (!normalizedUrl.ok) {
+        console.warn(`[OpenClawConfigSync] skipped MCP server "${server.name}" because its URL is invalid`);
+        continue;
+      }
+      normalizedRemoteUrl = normalizedUrl.url;
+    }
+
     switch (server.transportType) {
       case 'stdio':
         if (server.command) entry.command = server.command;
@@ -1014,12 +1043,12 @@ function buildOpenClawMcpServers(
         if (server.env && Object.keys(server.env).length > 0) entry.env = server.env;
         break;
       case 'sse':
-        if (server.url) entry.url = server.url;
+        entry.url = normalizedRemoteUrl;
         if (server.headers && Object.keys(server.headers).length > 0)
           entry.headers = lowercaseHeaderKeys(server.headers);
         break;
       case 'http':
-        if (server.url) entry.url = server.url;
+        entry.url = normalizedRemoteUrl;
         if (server.headers && Object.keys(server.headers).length > 0)
           entry.headers = lowercaseHeaderKeys(server.headers);
         entry.transport = 'streamable-http';
@@ -1037,6 +1066,8 @@ export type OpenClawConfigSyncResult = {
   error?: string;
   agentsMdWarning?: string;
   bindingsChanged?: boolean;
+  changedTopLevelKeys?: string[];
+  restartImpact?: OpenClawConfigImpact;
 };
 
 const buildStreamingModeConfig = (
@@ -1065,10 +1096,12 @@ type OpenClawConfigSyncDeps = {
   getIMSettings?: () => IMSettings | null;
   getResolvedMcpServers?: () => ResolvedMcpServer[];
   getAskUserCallbackUrl?: () => string | null;
+  getMediaCallbackUrl?: () => string | null;
   getMcpBridgeSecret?: () => string;
   getSkillsList?: () => Array<{ id: string; enabled: boolean }>;
   getAgents?: () => Agent[];
   getUserPlugins?: () => Array<{ pluginId: string; enabled: boolean; config?: Record<string, unknown> }>;
+  canUseMediaGeneration?: () => boolean;
 };
 
 export class OpenClawConfigSync {
@@ -1091,10 +1124,12 @@ export class OpenClawConfigSync {
   private readonly getIMSettings?: () => IMSettings | null;
   private readonly getResolvedMcpServers?: () => ResolvedMcpServer[];
   private readonly getAskUserCallbackUrl?: () => string | null;
+  private readonly getMediaCallbackUrl?: () => string | null;
   private readonly getMcpBridgeSecret?: () => string;
   private readonly getSkillsList?: () => Array<{ id: string; enabled: boolean }>;
   private readonly getAgents?: () => Agent[];
   private readonly getUserPlugins: () => Array<{ pluginId: string; enabled: boolean; config?: Record<string, unknown> }>;
+  private readonly canUseMediaGeneration: () => boolean;
   private previousBindingsJson?: string;
   private currentBindingsObj: { bindings?: Array<Record<string, unknown>> } = {};
 
@@ -1118,10 +1153,12 @@ export class OpenClawConfigSync {
     this.getIMSettings = deps.getIMSettings;
     this.getResolvedMcpServers = deps.getResolvedMcpServers;
     this.getAskUserCallbackUrl = deps.getAskUserCallbackUrl;
+    this.getMediaCallbackUrl = deps.getMediaCallbackUrl;
     this.getMcpBridgeSecret = deps.getMcpBridgeSecret;
     this.getSkillsList = deps.getSkillsList;
     this.getAgents = deps.getAgents;
     this.getUserPlugins = deps.getUserPlugins ?? (() => []);
+    this.canUseMediaGeneration = deps.canUseMediaGeneration ?? (() => false);
   }
 
   /**
@@ -1200,7 +1237,10 @@ export class OpenClawConfigSync {
     };
 
     return {
-      deny: [...MANAGED_TOOL_DENY],
+      deny: [
+        ...MANAGED_TOOL_DENY
+      ],
+loopDetection: MANAGED_TOOL_LOOP_DETECTION,
       web: {
         search: {
           enabled: false,
@@ -1384,6 +1424,7 @@ export class OpenClawConfigSync {
       preinstalledPlugins.some((plugin) => pluginMatches(plugin, ...ids))
     );
     const hasAskUserPlugin = isBundledPluginAvailable('ask-user-question');
+    const hasMediaGenPlugin = isBundledPluginAvailable('lobster-media-generation');
     const qwenPortalAuthPluginId = resolveOpenClawExtensionPluginId('qwen-portal-auth');
 
     // Detect if any provider uses Qwen/Aliyun DashScope URLs — OpenClaw auto-injects
@@ -1443,6 +1484,8 @@ export class OpenClawConfigSync {
     const bindingsChanged = this.previousBindingsJson !== undefined
       && bindingsJson !== this.previousBindingsJson;
     this.previousBindingsJson = bindingsJson;
+
+    this.canUseMediaGeneration();
 
     const managedConfig: Record<string, unknown> = {
       gateway: {
@@ -1601,6 +1644,7 @@ export class OpenClawConfigSync {
             ? { feishu: { enabled: false } }
             : {}),
           ...(hasAskUserPlugin ? { 'ask-user-question': { enabled: true } } : {}),
+          ...(hasMediaGenPlugin ? { 'lobster-media-generation': { enabled: true } } : {}),
           // Some OpenClaw versions auto-inject qwen-portal-auth for
           // Qwen/DashScope URLs. Declare it only when the plugin actually
           // exists, otherwise it becomes a stale entry on every startup.
@@ -1668,6 +1712,21 @@ export class OpenClawConfigSync {
         config: {
           callbackUrl: askUserCallbackUrl,
           secret: '${LOBSTER_MCP_BRIDGE_SECRET}',
+        },
+      };
+    }
+
+    // Sync LobsterMediaGeneration plugin config — uses media callback endpoint
+    const mediaCallbackUrl = this.getMediaCallbackUrl?.();
+    if (hasMediaGenPlugin && mediaCallbackUrl && managedConfig.plugins) {
+      const plugins = managedConfig.plugins as Record<string, unknown>;
+      const entries = plugins.entries as Record<string, Record<string, unknown>>;
+      entries['lobster-media-generation'] = {
+        enabled: true,
+        config: {
+          callbackUrl: mediaCallbackUrl,
+          secret: '${LOBSTER_MCP_BRIDGE_SECRET}',
+          requestTimeoutMs: 120000,
         },
       };
     }
@@ -2197,6 +2256,7 @@ export class OpenClawConfigSync {
       }
     })();
 
+    let changedTopLevelKeys: string[] = [];
     if (configChanged) {
       // Diagnostic: diff gateway and plugins sections to identify what triggers OpenClaw restart
       try {
@@ -2224,8 +2284,11 @@ export class OpenClawConfigSync {
         }
         // Check which top-level keys actually changed
         const allKeys = new Set([...Object.keys(currentObj), ...Object.keys(nextObj)]);
-        const changedKeys = [...allKeys].filter(k => JSON.stringify(currentObj[k]) !== JSON.stringify(nextObj[k]));
-        console.log(`${gwDiagTs()} top-level changed keys:`, changedKeys.join(',') || '(none)');
+        changedTopLevelKeys = [...allKeys].filter(k => {
+          if (k === 'meta') return false;
+          return JSON.stringify(currentObj[k]) !== JSON.stringify(nextObj[k]);
+        });
+        console.log(`${gwDiagTs()} top-level changed keys:`, changedTopLevelKeys.join(',') || '(none)');
       } catch { /* ignore parse errors in diag */ }
       try {
         ensureDir(path.dirname(configPath));
@@ -2264,6 +2327,8 @@ export class OpenClawConfigSync {
       changed: configChanged || sessionStoreChanged,
       configPath,
       ...(bindingsChanged ? { bindingsChanged } : {}),
+      ...(changedTopLevelKeys.length > 0 ? { changedTopLevelKeys } : {}),
+      ...(changedTopLevelKeys.includes('mcp') ? { restartImpact: OpenClawConfigImpact.Restart } : {}),
       ...(agentsMdWarning ? { agentsMdWarning } : {}),
     };
   }

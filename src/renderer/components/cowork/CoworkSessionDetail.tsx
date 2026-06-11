@@ -2,11 +2,18 @@ import {
   DocumentArrowDownIcon,
   PhotoIcon,
 } from '@heroicons/react/24/outline';
-import React, { useCallback, useEffect, useLayoutEffect, useMemo,useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useDispatch, useSelector } from 'react-redux';
 
-import { normalizeFilePathForDedup, normalizeLocalServiceUrlForDedup, parseFileLinksFromMessage, parseFilePathsFromText, parseLocalServiceUrlsFromText, parseMediaTokensFromText, parseToolArtifact, stripFileLinksFromText } from '../../services/artifactParser';
+import type { CoworkImageAttachmentPreview } from '../../../shared/cowork/imageAttachments';
+import {
+  type CoworkSelectedTextSnippet,
+  CoworkSelectedTextSource,
+  type CoworkSelectedTextValidationError,
+  normalizeCoworkSelectedTextSnippets,
+} from '../../../shared/cowork/selectedText';
+import { dedupeArtifactsForDisplay, normalizeFilePathForDedup, normalizeLocalServiceUrlForDedup, parseFileLinksFromMessage, parseFilePathsFromText, parseLocalServiceUrlsFromText, parseMediaTokensFromText, parseRemoteImageArtifactsFromText, parseToolArtifact, parseToolResultMediaArtifacts, shouldParseFilePathsFromToolResult, stripFileLinksFromText } from '../../services/artifactParser';
 import { coworkService } from '../../services/cowork';
 import { i18nService } from '../../services/i18n';
 import { RootState } from '../../store';
@@ -22,6 +29,7 @@ import {
   activateArtifactFileListTab,
   activateArtifactPreviewTab,
   addArtifact,
+  type ArtifactPreviewTab,
   ArtifactSpecialTab,
   closeArtifactPreviewTab,
   closePanel,
@@ -30,22 +38,25 @@ import {
   selectActivePreviewTab,
   selectIsPanelOpen,
   selectPanelWidth,
-  selectPreviewTabs,
-  selectSessionArtifacts,
   togglePanel,
 } from '../../store/slices/artifactSlice';
+import { addDraftSelectedTextSnippet } from '../../store/slices/coworkSlice';
+import { setActiveKitIds } from '../../store/slices/kitSlice';
 import { setActiveSkillIds } from '../../store/slices/skillSlice';
 import type { Artifact } from '../../types/artifact';
 import { ArtifactTypeValue, PREVIEWABLE_ARTIFACT_TYPES } from '../../types/artifact';
-import type { CoworkImageAttachment,CoworkMessage, CoworkMessageMetadata } from '../../types/cowork';
+import type { CoworkImageAttachment, CoworkMessage, CoworkMessageMetadata } from '../../types/cowork';
 import { CoworkSessionStatusValue } from '../../types/cowork';
+import type { MediaAttachmentRef } from '../../types/mediaGeneration';
+import { parseUserMessageForDisplay } from '../../utils/userMessageDisplay';
 import { ArtifactPanel, type BrowserAnnotationPayload } from '../artifacts';
 import ComposeIcon from '../icons/ComposeIcon';
 import FileTypeIcon from '../icons/fileTypes/FileTypeIcon';
 import SidebarToggleIcon from '../icons/SidebarToggleIcon';
+import MarkdownContent from '../MarkdownContent';
 import WindowTitleBar from '../window/WindowTitleBar';
 import AssistantTurnBlock, { ContextCompactionDivider } from './AssistantTurnBlock';
-import { type CoworkOpenShareOptionsEventDetail,CoworkUiEvent } from './constants';
+import { type CoworkOpenShareOptionsEventDetail, CoworkUiEvent } from './constants';
 import ContextUsageIndicator from './ContextUsageIndicator';
 import CoworkPromptInput, { type CoworkPromptInputRef } from './CoworkPromptInput';
 import LazyRenderTurn, { clearHeightCache } from './LazyRenderTurn';
@@ -56,10 +67,18 @@ import {
   COWORK_DETAIL_GUTTER_CLASS,
   hasRenderableAssistantContent,
 } from './messageDisplayUtils';
+import {
+  buildCoworkSessionJSON,
+  buildCoworkSessionMarkdown,
+  CoworkTextExportFormat,
+  type CoworkTextExportFormat as CoworkTextExportFormatValue,
+  mergeCoworkTextExportMessages,
+} from './sessionExport';
 import UserMessageItem from './UserMessageItem';
 interface CoworkSessionDetailProps {
   onManageSkills?: () => void;
-  onContinue: (prompt: string, skillPrompt?: string, imageAttachments?: CoworkImageAttachment[]) => boolean | void | Promise<boolean | void>;
+  onManageKits?: () => void;
+  onContinue: (prompt: string, skillPrompt?: string, imageAttachments?: CoworkImageAttachment[], mediaReferences?: MediaAttachmentRef[], selectedTextSnippets?: CoworkSelectedTextSnippet[]) => boolean | void | Promise<boolean | void>;
   onStop: () => void;
   isSidebarCollapsed?: boolean;
   onToggleSidebar?: () => void;
@@ -75,6 +94,120 @@ const ARTIFACT_PANEL_RESIZE_HANDLE_WIDTH = 4;
 const COWORK_DETAIL_MIN_WIDTH = 480;
 const ARTIFACT_PANEL_MIN_WIDTH_RATIO = 1 / 6;
 const INVALID_FILE_NAME_PATTERN = /[<>:"/\\|?*\u0000-\u001F]/g;
+const SELECTED_TEXT_ACTION_HALF_WIDTH = 72;
+const SELECTED_TEXT_ACTION_SUPPRESS_MS = 250;
+const EXPANDED_CONVERSATION_PREVIEW_COLLAPSED_MAX_LENGTH = 140;
+const EXPANDED_CONVERSATION_PREVIEW_ITEM_MAX_LENGTH = 520;
+const EXPANDED_CONVERSATION_PREVIEW_ITEM_LIMIT = 8;
+
+type ExpandedConversationPreviewItem = {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  summary: string;
+};
+
+type ExpandedConversationPreview = {
+  latest: ExpandedConversationPreviewItem;
+  items: ExpandedConversationPreviewItem[];
+};
+
+function normalizeExpandedConversationPreviewText(value: string): string {
+  return value
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/[#>*_~]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function truncateExpandedConversationPreviewText(value: string, maxLength: number): string {
+  const characters = Array.from(value);
+  if (characters.length <= maxLength) return value;
+  return `${characters.slice(0, maxLength).join('')}...`;
+}
+
+function getExpandedConversationPreview(messages: CoworkMessage[]): ExpandedConversationPreview | null {
+  const items: ExpandedConversationPreviewItem[] = [];
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.type !== 'user' && message.type !== 'assistant') continue;
+    if (message.metadata?.isThinking) continue;
+
+    const content = message.type === 'user'
+      ? parseUserMessageForDisplay(message.content || '')
+      : message.content;
+    const text = normalizeExpandedConversationPreviewText(content);
+    if (!text) continue;
+
+    items.push({
+      id: message.id,
+      role: message.type,
+      content,
+      summary: truncateExpandedConversationPreviewText(text, EXPANDED_CONVERSATION_PREVIEW_ITEM_MAX_LENGTH),
+    });
+
+    if (items.length >= EXPANDED_CONVERSATION_PREVIEW_ITEM_LIMIT) break;
+  }
+
+  if (items.length === 0) return null;
+
+  const orderedItems = items.reverse();
+  const latestItem = orderedItems[orderedItems.length - 1];
+
+  return {
+    latest: {
+      ...latestItem,
+      summary: truncateExpandedConversationPreviewText(
+        latestItem.summary,
+        EXPANDED_CONVERSATION_PREVIEW_COLLAPSED_MAX_LENGTH,
+      ),
+    },
+    items: orderedItems,
+  };
+}
+
+function normalizeBrowserPreviewUrlForMatch(value: string): string {
+  try {
+    const url = new URL(value);
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return value;
+  }
+}
+
+function isSameBrowserPreviewUrl(value: string, previewUrl: string): boolean {
+  if (!value || !previewUrl) return false;
+  return normalizeBrowserPreviewUrlForMatch(value) === normalizeBrowserPreviewUrlForMatch(previewUrl);
+}
+
+type SelectedAssistantTextRange = {
+  text: string;
+  sourceMessageId: string;
+  rect: DOMRect;
+};
+const SELECTED_TEXT_ERROR_I18N_KEYS: Record<CoworkSelectedTextValidationError, string> = {
+  empty: 'coworkSelectedTextInvalid',
+  invalid: 'coworkSelectedTextInvalid',
+  too_long: 'coworkSelectedTextTooLong',
+  too_many: 'coworkSelectedTextTooMany',
+  total_too_long: 'coworkSelectedTextTotalTooLong',
+  duplicate: 'coworkSelectedTextDuplicate',
+};
+
+const extractBase64FromDataUrl = (dataUrl: string): { mimeType: string; base64Data: string } | null => {
+  const match = /^data:(.+);base64,(.*)$/s.exec(dataUrl);
+  if (!match) return null;
+  return { mimeType: match[1], base64Data: match[2] };
+};
+
+const showToast = (message: string): void => {
+  window.dispatchEvent(new CustomEvent('app:showToast', { detail: message }));
+};
 
 const sanitizeExportFileName = (value: string): string => {
   const sanitized = value.replace(INVALID_FILE_NAME_PATTERN, ' ').replace(/\s+/g, ' ').trim();
@@ -84,6 +217,59 @@ const sanitizeExportFileName = (value: string): string => {
 const formatExportTimestamp = (value: Date): string => {
   const pad = (num: number): string => String(num).padStart(2, '0');
   return `${value.getFullYear()}${pad(value.getMonth() + 1)}${pad(value.getDate())}-${pad(value.getHours())}${pad(value.getMinutes())}${pad(value.getSeconds())}`;
+};
+
+const logDetailDiagnostic = (message: string): void => {
+  console.log(`[CoworkSessionDetail] ${message}`);
+  window.electron?.log?.fromRenderer?.('info', 'CoworkSessionDetail', message);
+};
+
+const getSelectionAnchorRect = (range: Range): DOMRect => {
+  const lineRects = Array.from(range.getClientRects())
+    .filter(rect => rect.width > 0 && rect.height > 0);
+  return lineRects[0] ?? range.getBoundingClientRect();
+};
+
+const getSelectedAssistantTextRange = (): SelectedAssistantTextRange | null => {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+    return null;
+  }
+  const range = selection.getRangeAt(0);
+  const startElement = range.startContainer.parentElement;
+  const endElement = range.endContainer.parentElement;
+  const startMessage = startElement?.closest<HTMLElement>('[data-cowork-assistant-message-id]');
+  const endMessage = endElement?.closest<HTMLElement>('[data-cowork-assistant-message-id]');
+  const sourceMessageId = startMessage?.dataset.coworkAssistantMessageId;
+  const text = selection.toString().trim();
+  if (!sourceMessageId || startMessage !== endMessage || !text) {
+    return null;
+  }
+  return {
+    text,
+    sourceMessageId,
+    rect: getSelectionAnchorRect(range),
+  };
+};
+
+const getSelectedTextActionLeft = (rect: DOMRect, container: HTMLDivElement): number => {
+  const containerRect = container.getBoundingClientRect();
+  const selectionCenterX = rect.left - containerRect.left + rect.width / 2;
+  return Math.min(
+    container.clientWidth - SELECTED_TEXT_ACTION_HALF_WIDTH,
+    Math.max(SELECTED_TEXT_ACTION_HALF_WIDTH, selectionCenterX),
+  );
+};
+
+const getSelectedTextActionTop = (
+  rect: DOMRect,
+  container: HTMLDivElement,
+): number => {
+  const containerRect = container.getBoundingClientRect();
+  const rawTop = container.scrollTop + rect.top - containerRect.top - 42;
+  const minTop = container.scrollTop + 8;
+  const maxTop = container.scrollTop + container.clientHeight - 48;
+  return Math.min(maxTop, Math.max(minTop, rawTop));
 };
 
 type CaptureRect = { x: number; y: number; width: number; height: number };
@@ -301,6 +487,36 @@ const ArtifactPanelIcon: React.FC<React.SVGProps<SVGSVGElement> & { open?: boole
   );
 };
 
+const PanelExpandIcon: React.FC<React.SVGProps<SVGSVGElement>> = (props) => (
+  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" {...props}>
+    <path d="M10 3h3v3" />
+    <path d="M6 13H3v-3" />
+    <path d="M9 7l4-4" />
+    <path d="M7 9l-4 4" />
+  </svg>
+);
+
+const PanelRestoreIcon: React.FC<React.SVGProps<SVGSVGElement>> = (props) => (
+  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" {...props}>
+    <path d="M13.25 2.75l-4 4" />
+    <path d="M9.25 3.75v3h3" />
+    <path d="M2.75 13.25l4-4" />
+    <path d="M3.75 9.25h3v3" />
+  </svg>
+);
+
+const PromptInputCollapseIcon: React.FC<React.SVGProps<SVGSVGElement>> = (props) => (
+  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" {...props}>
+    <path d="M4.5 6.25L8 9.75l3.5-3.5" />
+  </svg>
+);
+
+const PromptInputExpandIcon: React.FC<React.SVGProps<SVGSVGElement>> = (props) => (
+  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" {...props}>
+    <path d="M4.5 9.75L8 6.25l3.5 3.5" />
+  </svg>
+);
+
 const ArtifactTabCloseIcon: React.FC<React.SVGProps<SVGSVGElement>> = (props) => (
   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" {...props}>
     <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" />
@@ -486,9 +702,11 @@ const toAbsolutePathFromCwd = (filePath: string, cwd: string): string => {
 };
 
 const EMPTY_ARTIFACTS: Artifact[] = [];
+const EMPTY_PREVIEW_TABS: ArtifactPreviewTab[] = [];
 
 const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   onManageSkills,
+  onManageKits,
   onContinue,
   onStop,
   isSidebarCollapsed,
@@ -504,6 +722,10 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const lastMessageContent = useSelector(selectLastMessageContent);
   const messagesLength = useSelector(selectCurrentMessagesLength);
   const skills = useSelector((state: RootState) => state.skill.skills);
+  const marketplaceKits = useSelector((state: RootState) => state.kit.marketplaceKits);
+  const selectedDraftSnippets = useSelector((state: RootState) =>
+    currentSession?.id ? state.cowork.draftSelectedTextSnippets[currentSession.id] ?? [] : []
+  );
   const contextUsage = useSelector((state: RootState) =>
     currentSession?.id ? state.cowork.contextUsageBySessionId[currentSession.id] : undefined
   );
@@ -522,8 +744,51 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
   const [isLoadingMoreMessages, setIsLoadingMoreMessages] = useState(false);
   const [showCompactConfirm, setShowCompactConfirm] = useState(false);
+  const [selectedTextAction, setSelectedTextAction] = useState<{
+    text: string;
+    sourceMessageId: string;
+    left: number;
+    top: number;
+  } | null>(null);
   const isLoadingMoreMessagesRef = useRef(false);
   const prevScrollHeightRef = useRef<number | null>(null);
+  const suppressSelectedTextActionUntilRef = useRef(0);
+
+  const closeSelectedTextAction = useCallback((options: {
+    clearSelection?: boolean;
+    suppressNextMouseUp?: boolean;
+  } = {}) => {
+    if (options.suppressNextMouseUp) {
+      suppressSelectedTextActionUntilRef.current = Date.now() + SELECTED_TEXT_ACTION_SUPPRESS_MS;
+    }
+    if (options.clearSelection) {
+      window.getSelection()?.removeAllRanges();
+    }
+    setSelectedTextAction(null);
+  }, []);
+
+  const syncSelectedTextActionPosition = useCallback((options: {
+    closeWhenMissing?: boolean;
+  } = {}) => {
+    const selectedRange = getSelectedAssistantTextRange();
+    if (!selectedRange) {
+      if (options.closeWhenMissing) {
+        closeSelectedTextAction();
+      }
+      return;
+    }
+    const container = scrollContainerRef.current;
+    if (!container) {
+      closeSelectedTextAction();
+      return;
+    }
+    setSelectedTextAction({
+      text: selectedRange.text,
+      sourceMessageId: selectedRange.sourceMessageId,
+      left: getSelectedTextActionLeft(selectedRange.rect, container),
+      top: getSelectedTextActionTop(selectedRange.rect, container),
+    });
+  }, [closeSelectedTextAction]);
 
   // Clear lazy-render height cache when session changes
   const sessionId = currentSession?.id;
@@ -532,13 +797,31 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   }, [sessionId]);
 
   useEffect(() => {
-    if (!sessionId) return;
-    coworkService.refreshContextUsageForSessionEntry(sessionId);
-  }, [sessionId]);
+    setShowCompactConfirm(false);
+    closeSelectedTextAction({ clearSelection: true });
+  }, [closeSelectedTextAction, sessionId]);
 
   useEffect(() => {
-    setShowCompactConfirm(false);
-  }, [sessionId]);
+    if (!selectedTextAction) return undefined;
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest('[data-cowork-selected-text-action]')) {
+        return;
+      }
+      closeSelectedTextAction({ clearSelection: true, suppressNextMouseUp: true });
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeSelectedTextAction({ clearSelection: true });
+      }
+    };
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [closeSelectedTextAction, selectedTextAction]);
 
   useEffect(() => {
     if (!showCompactConfirm) return undefined;
@@ -581,6 +864,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
 
   // Export states
   const [isExportingImage, setIsExportingImage] = useState(false);
+  const [isExportingText, setIsExportingText] = useState(false);
   const [showExportOptions, setShowExportOptions] = useState(false);
 
   useEffect(() => {
@@ -623,6 +907,94 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     void coworkService.compactContext(currentSession.id);
   }, [currentSession?.id]);
 
+  const handleForkMessage = useCallback((messageId: string) => {
+    if (!currentSession?.id) {
+      console.warn('[CoworkFork] message fork was ignored because no session is selected');
+      return;
+    }
+    if (isStreaming || currentSession.status === CoworkSessionStatusValue.Running) {
+      window.dispatchEvent(new CustomEvent('app:showToast', {
+        detail: i18nService.t('coworkForkRunningBlocked'),
+      }));
+      console.warn('[CoworkFork] message fork was rejected because the session is still running');
+      return;
+    }
+
+    console.log(`[CoworkFork] requesting a fork from assistant message ${messageId} in session ${currentSession.id}`);
+    void coworkService.forkSession({
+      sessionId: currentSession.id,
+      forkedFromMessageId: messageId,
+    });
+  }, [currentSession?.id, currentSession?.status, isStreaming]);
+
+  const handleAssistantTextSelection = useCallback(() => {
+    if (remoteManaged) return;
+    if (Date.now() < suppressSelectedTextActionUntilRef.current) {
+      return;
+    }
+    suppressSelectedTextActionUntilRef.current = 0;
+    syncSelectedTextActionPosition({ closeWhenMissing: true });
+  }, [remoteManaged, syncSelectedTextActionPosition]);
+
+  const addSelectedTextSnippetToDraft = useCallback((snippet: CoworkSelectedTextSnippet) => {
+    if (!currentSession?.id) return;
+    const sourceType = snippet.sourceType ?? snippet.sourceMessageType ?? 'unknown';
+    const sourceLabel = snippet.sourceTitle?.trim()
+      || snippet.sourceId
+      || snippet.sourceMessageId
+      || 'unknown source';
+    const result = normalizeCoworkSelectedTextSnippets([...selectedDraftSnippets, snippet]);
+    if (result.success === false) {
+      logDetailDiagnostic(
+        `rejected a selected text excerpt for session ${currentSession.id}; `
+        + `source type is ${sourceType}, source is ${sourceLabel}, and reason is ${result.error}`,
+      );
+      window.dispatchEvent(new CustomEvent('app:showToast', {
+        detail: i18nService.t(SELECTED_TEXT_ERROR_I18N_KEYS[result.error]),
+      }));
+      return;
+    }
+    dispatch(addDraftSelectedTextSnippet({ draftKey: currentSession.id, snippet }));
+    logDetailDiagnostic(
+      `added a selected text excerpt to the draft for session ${currentSession.id}; `
+      + `source type is ${sourceType}, source is ${sourceLabel}; `
+      + `${result.snippets.length} excerpts now contain ${result.snippets.reduce((total, item) => total + item.text.length, 0)} characters`,
+    );
+    promptInputRef.current?.focus();
+  }, [currentSession?.id, dispatch, selectedDraftSnippets]);
+
+  const handleAddSelectedText = useCallback(() => {
+    if (!selectedTextAction) return;
+    addSelectedTextSnippetToDraft({
+      id: `selected-text-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      text: selectedTextAction.text,
+      sourceMessageId: selectedTextAction.sourceMessageId,
+      sourceMessageType: CoworkSelectedTextSource.AssistantMessage,
+      sourceId: selectedTextAction.sourceMessageId,
+      sourceType: CoworkSelectedTextSource.AssistantMessage,
+      createdAt: Date.now(),
+    });
+    closeSelectedTextAction({ clearSelection: true });
+  }, [addSelectedTextSnippetToDraft, closeSelectedTextAction, selectedTextAction]);
+
+  const handleLocateSelectedText = useCallback((sourceMessageId: string) => {
+    const container = scrollContainerRef.current;
+    const element = Array.from(
+      container?.querySelectorAll<HTMLElement>('[data-cowork-assistant-message-id]') ?? [],
+    ).find(candidate => candidate.dataset.coworkAssistantMessageId === sourceMessageId);
+    if (!element) {
+      window.dispatchEvent(new CustomEvent('app:showToast', {
+        detail: i18nService.t('coworkSelectedTextSourceUnavailable'),
+      }));
+      return;
+    }
+    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    element.classList.add('ring-2', 'ring-primary/50', 'rounded-lg');
+    window.setTimeout(() => {
+      element.classList.remove('ring-2', 'ring-primary/50', 'rounded-lg');
+    }, 1600);
+  }, []);
+
   // ─── Artifact detection ─────────────────────────────────────────────
   const isPanelOpen = useSelector((state: RootState) => selectIsPanelOpen(state, sessionId));
   const panelWidth = useSelector(selectPanelWidth);
@@ -634,6 +1006,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const [activeSpecialPreviewTab, setActiveSpecialPreviewTab] = useState<ArtifactSpecialTab>(ArtifactSpecialTab.FileList);
   const [browserPreviewAddress, setBrowserPreviewAddress] = useState('');
   const [browserPreviewUrl, setBrowserPreviewUrl] = useState('');
+  const [browserHtmlPreviewArtifactId, setBrowserHtmlPreviewArtifactId] = useState<string | null>(null);
   const [showArtifactAddMenu, setShowArtifactAddMenu] = useState(false);
   const [artifactAddMenuPosition, setArtifactAddMenuPosition] = useState<{ left: number; top: number } | null>(null);
   const [artifactTabsCanScrollLeft, setArtifactTabsCanScrollLeft] = useState(false);
@@ -641,21 +1014,35 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const [artifactTabsIsOverflowing, setArtifactTabsIsOverflowing] = useState(false);
   const [artifactPanelMinWidth, setArtifactPanelMinWidth] = useState(MIN_PANEL_WIDTH);
   const [artifactPanelMaxWidth, setArtifactPanelMaxWidth] = useState(MAX_PANEL_WIDTH);
+  const [contentRowWidth, setContentRowWidth] = useState(0);
+  const [promptInputAreaHeight, setPromptInputAreaHeight] = useState(0);
+  const [isArtifactPanelExpanded, setIsArtifactPanelExpanded] = useState(false);
+  const [isExpandedPromptInputHidden, setIsExpandedPromptInputHidden] = useState(false);
+  const [isExpandedConversationPreviewOpen, setIsExpandedConversationPreviewOpen] = useState(false);
   const previousArtifactPanelOpenRef = useRef(isPanelOpen);
   const fileListPreviewTabOpenBySessionRef = useRef<Record<string, boolean>>({});
   const browserPreviewTabOpenBySessionRef = useRef<Record<string, boolean>>({});
   const activeSpecialPreviewTabBySessionRef = useRef<Record<string, ArtifactSpecialTab>>({});
   const browserPreviewAddressBySessionRef = useRef<Record<string, string>>({});
   const browserPreviewUrlBySessionRef = useRef<Record<string, string>>({});
+  const browserHtmlPreviewArtifactIdBySessionRef = useRef<Record<string, string>>({});
+  const browserHtmlPreviewSessionIdBySessionRef = useRef<Record<string, string>>({});
+  const browserHtmlPreviewUrlBySessionRef = useRef<Record<string, string>>({});
+  const browserHtmlPreviewRequestIdRef = useRef(0);
   const artifactAddButtonRef = useRef<HTMLButtonElement>(null);
   const artifactAddMenuRef = useRef<HTMLDivElement>(null);
   const artifactTabsScrollRef = useRef<HTMLDivElement>(null);
   const contentRowRef = useRef<HTMLDivElement>(null);
-  const sessionArtifacts = useSelector((state: RootState) =>
-    sessionId ? selectSessionArtifacts(state, sessionId) : EMPTY_ARTIFACTS
+  const promptInputAreaRef = useRef<HTMLDivElement>(null);
+  const rawSessionArtifacts = useSelector((state: RootState) =>
+    sessionId ? state.artifact.artifactsBySession[sessionId] ?? EMPTY_ARTIFACTS : EMPTY_ARTIFACTS
+  );
+  const sessionArtifacts = useMemo(
+    () => dedupeArtifactsForDisplay(rawSessionArtifacts),
+    [rawSessionArtifacts],
   );
   const artifactPreviewTabs = useSelector((state: RootState) =>
-    sessionId ? selectPreviewTabs(state, sessionId) : []
+    sessionId ? state.artifact.previewTabsBySession[sessionId] ?? EMPTY_PREVIEW_TABS : EMPTY_PREVIEW_TABS
   );
   const activeArtifactPreviewTab = useSelector((state: RootState) =>
     sessionId ? selectActivePreviewTab(state, sessionId) : null
@@ -715,6 +1102,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const updateArtifactPanelMaxWidth = useCallback(() => {
     const contentWidth = contentRowRef.current?.clientWidth ?? 0;
     if (contentWidth <= 0) return;
+    setContentRowWidth(contentWidth);
     const availablePanelWidth = contentWidth - COWORK_DETAIL_MIN_WIDTH - ARTIFACT_PANEL_RESIZE_HANDLE_WIDTH;
     const nextMaxWidth = Math.min(MAX_PANEL_WIDTH, Math.max(MIN_PANEL_WIDTH, availablePanelWidth));
     const proportionalMinWidth = Math.floor(contentWidth * ARTIFACT_PANEL_MIN_WIDTH_RATIO);
@@ -742,6 +1130,36 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     };
   }, [currentSession?.id, updateArtifactPanelMaxWidth]);
 
+  const updatePromptInputAreaHeight = useCallback(() => {
+    setPromptInputAreaHeight(promptInputAreaRef.current?.offsetHeight ?? 0);
+  }, []);
+
+  useLayoutEffect(() => {
+    updatePromptInputAreaHeight();
+    const element = promptInputAreaRef.current;
+    window.addEventListener('resize', updatePromptInputAreaHeight);
+
+    if (typeof ResizeObserver === 'undefined' || !element) {
+      return () => {
+        window.removeEventListener('resize', updatePromptInputAreaHeight);
+      };
+    }
+
+    const resizeObserver = new ResizeObserver(updatePromptInputAreaHeight);
+    resizeObserver.observe(element);
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener('resize', updatePromptInputAreaHeight);
+    };
+  }, [currentSession?.id, isExpandedPromptInputHidden, updatePromptInputAreaHeight]);
+
+  useEffect(() => {
+    if (isPanelOpen) return;
+    setIsArtifactPanelExpanded(false);
+    setIsExpandedPromptInputHidden(false);
+    setIsExpandedConversationPreviewOpen(false);
+  }, [isPanelOpen]);
+
   useEffect(() => {
     setIsFileListPreviewTabOpen(sessionId ? fileListPreviewTabOpenBySessionRef.current[sessionId] ?? false : false);
     setIsBrowserPreviewTabOpen(sessionId ? browserPreviewTabOpenBySessionRef.current[sessionId] ?? false : false);
@@ -750,9 +1168,24 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       : ArtifactSpecialTab.FileList);
     setBrowserPreviewAddress(sessionId ? browserPreviewAddressBySessionRef.current[sessionId] ?? '' : '');
     setBrowserPreviewUrl(sessionId ? browserPreviewUrlBySessionRef.current[sessionId] ?? '' : '');
+    setBrowserHtmlPreviewArtifactId(sessionId ? browserHtmlPreviewArtifactIdBySessionRef.current[sessionId] ?? null : null);
+    setIsArtifactPanelExpanded(false);
+    setIsExpandedPromptInputHidden(false);
+    setIsExpandedConversationPreviewOpen(false);
     setShowArtifactAddMenu(false);
     loadedFileIdsRef.current = new Set();
   }, [sessionId]);
+
+  useEffect(() => (
+    () => {
+      for (const previewSessionId of Object.values(browserHtmlPreviewSessionIdBySessionRef.current)) {
+        void window.electron?.artifact?.destroyPreviewSession(previewSessionId);
+      }
+      browserHtmlPreviewSessionIdBySessionRef.current = {};
+      browserHtmlPreviewUrlBySessionRef.current = {};
+      browserHtmlPreviewArtifactIdBySessionRef.current = {};
+    }
+  ), []);
 
   const setSessionFileListPreviewTabOpen = useCallback((open: boolean) => {
     setIsFileListPreviewTabOpen(open);
@@ -782,12 +1215,30 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     }
   }, [sessionId]);
 
+  const clearBrowserHtmlPreviewState = useCallback((targetSessionId = sessionId) => {
+    if (!targetSessionId) return;
+    const previewSessionId = browserHtmlPreviewSessionIdBySessionRef.current[targetSessionId];
+    if (previewSessionId) {
+      void window.electron?.artifact?.destroyPreviewSession(previewSessionId);
+    }
+    delete browserHtmlPreviewSessionIdBySessionRef.current[targetSessionId];
+    delete browserHtmlPreviewUrlBySessionRef.current[targetSessionId];
+    delete browserHtmlPreviewArtifactIdBySessionRef.current[targetSessionId];
+    if (targetSessionId === sessionId) {
+      setBrowserHtmlPreviewArtifactId(null);
+    }
+  }, [sessionId]);
+
   const handleBrowserPreviewUrlChange = useCallback((value: string) => {
     setBrowserPreviewUrl(value);
     if (sessionId) {
       browserPreviewUrlBySessionRef.current[sessionId] = value;
+      const htmlPreviewUrl = browserHtmlPreviewUrlBySessionRef.current[sessionId];
+      if (htmlPreviewUrl && !isSameBrowserPreviewUrl(value, htmlPreviewUrl)) {
+        clearBrowserHtmlPreviewState(sessionId);
+      }
     }
-  }, [sessionId]);
+  }, [clearBrowserHtmlPreviewState, sessionId]);
 
   const clearBrowserPreviewState = useCallback(() => {
     setBrowserPreviewAddress('');
@@ -795,8 +1246,9 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     if (sessionId) {
       delete browserPreviewAddressBySessionRef.current[sessionId];
       delete browserPreviewUrlBySessionRef.current[sessionId];
+      clearBrowserHtmlPreviewState(sessionId);
     }
-  }, [sessionId]);
+  }, [clearBrowserHtmlPreviewState, sessionId]);
 
   const handleOpenArtifactFileListTab = useCallback(() => {
     setSessionFileListPreviewTabOpen(true);
@@ -820,6 +1272,80 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     setSessionActiveSpecialPreviewTab(ArtifactSpecialTab.Browser);
     dispatch(activateArtifactBrowserTab({ sessionId }));
   }, [dispatch, sessionId, setSessionActiveSpecialPreviewTab, setSessionBrowserPreviewTabOpen]);
+
+  const handleToggleArtifactPanelExpanded = useCallback(() => {
+    setIsArtifactPanelExpanded(value => {
+      const nextValue = !value;
+      if (!nextValue) {
+        setIsExpandedPromptInputHidden(false);
+        setIsExpandedConversationPreviewOpen(false);
+      }
+      return nextValue;
+    });
+  }, []);
+
+  const handleToggleExpandedPromptInput = useCallback(() => {
+    setIsExpandedPromptInputHidden(value => {
+      const nextValue = !value;
+      if (nextValue) {
+        setIsExpandedConversationPreviewOpen(false);
+      }
+      return nextValue;
+    });
+  }, []);
+
+  const handleOpenHtmlFileInBrowser = useCallback(async (artifact: Artifact) => {
+    if (!sessionId || artifact.type !== ArtifactTypeValue.Html || !artifact.filePath) return;
+
+    setShowArtifactAddMenu(false);
+    setSessionBrowserPreviewTabOpen(true);
+    setSessionActiveSpecialPreviewTab(ArtifactSpecialTab.Browser);
+    dispatch(activateArtifactBrowserTab({ sessionId }));
+
+    const requestId = browserHtmlPreviewRequestIdRef.current + 1;
+    browserHtmlPreviewRequestIdRef.current = requestId;
+    const previousPreviewSessionId = browserHtmlPreviewSessionIdBySessionRef.current[sessionId];
+    try {
+      const result = await window.electron?.artifact?.createPreviewSession(artifact.filePath);
+      if (
+        browserHtmlPreviewRequestIdRef.current !== requestId ||
+        currentSession?.id !== sessionId
+      ) {
+        if (result?.success && result.sessionId) {
+          void window.electron?.artifact?.destroyPreviewSession(result.sessionId);
+        }
+        return;
+      }
+      if (!result?.success || !result.url || !result.sessionId) {
+        throw new Error(result?.error || i18nService.t('artifactSourceLoadFailed'));
+      }
+      if (previousPreviewSessionId && previousPreviewSessionId !== result.sessionId) {
+        void window.electron?.artifact?.destroyPreviewSession(previousPreviewSessionId);
+      }
+      browserHtmlPreviewArtifactIdBySessionRef.current[sessionId] = artifact.id;
+      browserHtmlPreviewSessionIdBySessionRef.current[sessionId] = result.sessionId;
+      browserHtmlPreviewUrlBySessionRef.current[sessionId] = result.url;
+      setBrowserHtmlPreviewArtifactId(artifact.id);
+      handleBrowserPreviewAddressChange(artifact.filePath);
+      handleBrowserPreviewUrlChange(result.url);
+    } catch (error) {
+      if (!previousPreviewSessionId) {
+        clearBrowserHtmlPreviewState(sessionId);
+      }
+      window.dispatchEvent(new CustomEvent('app:showToast', {
+        detail: error instanceof Error ? error.message : i18nService.t('artifactSourceLoadFailed'),
+      }));
+    }
+  }, [
+    clearBrowserHtmlPreviewState,
+    currentSession?.id,
+    dispatch,
+    handleBrowserPreviewAddressChange,
+    handleBrowserPreviewUrlChange,
+    sessionId,
+    setSessionActiveSpecialPreviewTab,
+    setSessionBrowserPreviewTabOpen,
+  ]);
 
   const handleOpenLocalServiceArtifact = useCallback((artifact: Artifact) => {
     const url = artifact.url || artifact.content;
@@ -955,6 +1481,13 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     setSessionActiveSpecialPreviewTab,
     setSessionFileListPreviewTabOpen,
   ]);
+
+  useEffect(() => {
+    window.addEventListener(CoworkUiEvent.ShortcutToggleArtifacts, handleToggleArtifactPanel);
+    return () => {
+      window.removeEventListener(CoworkUiEvent.ShortcutToggleArtifacts, handleToggleArtifactPanel);
+    };
+  }, [handleToggleArtifactPanel]);
 
   const handleToggleArtifactAddMenu = useCallback(() => {
     setShowArtifactAddMenu(open => !open);
@@ -1108,6 +1641,13 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       const detected: Artifact[] = [];
       const seenFilePaths = new Set<string>();
       const seenLocalServiceUrls = new Set<string>();
+      const rememberArtifactFilePaths = (artifacts: Artifact[]) => {
+        for (const artifact of artifacts) {
+          if (artifact.filePath) {
+            seenFilePaths.add(normalizeFilePathForDedup(artifact.filePath));
+          }
+        }
+      };
 
       for (const msg of messages) {
         if (msg.type === 'assistant' && !msg.metadata?.isThinking && msg.content) {
@@ -1139,9 +1679,20 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
               detected.push(pa);
             }
           }
+
+          detected.push(...parseRemoteImageArtifactsFromText(msg.content, msg.id, sessionId, 'artifact-remote-assistant'));
         }
 
-        if (msg.type === 'tool_result' && msg.content) {
+        if (msg.type === 'tool_result') {
+          const toolMediaArtifacts = parseToolResultMediaArtifacts(msg, sessionId);
+          if (toolMediaArtifacts.length > 0) {
+            detected.push(...toolMediaArtifacts);
+            rememberArtifactFilePaths(toolMediaArtifacts);
+            continue;
+          }
+
+          if (!msg.content) continue;
+
           const mediaArtifacts = parseMediaTokensFromText(msg.content, msg.id, sessionId);
           for (const ma of mediaArtifacts) {
             const normalized = ma.filePath ? normalizeFilePathForDedup(ma.filePath) : '';
@@ -1150,6 +1701,60 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
               detected.push(ma);
             }
           }
+
+          // Only parse bare file paths from tool results of image generation tools.
+          // Other tools (e.g. Bash running `find`) may output many file paths in their
+          // results that should NOT become artifacts.
+          const toolUseId = msg.metadata?.toolUseId;
+          const pairedToolUse = toolUseId
+            ? messages.find(m => m.type === 'tool_use' && m.metadata?.toolUseId === toolUseId)
+            : undefined;
+          const toolName = pairedToolUse?.metadata?.toolName
+            ? String(pairedToolUse.metadata.toolName)
+            : '';
+          if (shouldParseFilePathsFromToolResult(toolName)) {
+            const pathArtifacts = parseFilePathsFromText(msg.content, msg.id, sessionId, 'artifact-toolresult');
+            for (const pa of pathArtifacts) {
+              const normalized = pa.filePath ? normalizeFilePathForDedup(pa.filePath) : '';
+              if (pa.filePath && !seenFilePaths.has(normalized)) {
+                seenFilePaths.add(normalized);
+                detected.push(pa);
+              }
+            }
+          }
+          detected.push(...parseRemoteImageArtifactsFromText(msg.content, msg.id, sessionId, 'artifact-remote-toolresult'));
+        }
+
+        if (msg.type === 'system') {
+          const toolMediaArtifacts = parseToolResultMediaArtifacts(msg, sessionId);
+          if (toolMediaArtifacts.length > 0) {
+            detected.push(...toolMediaArtifacts);
+            rememberArtifactFilePaths(toolMediaArtifacts);
+            continue;
+          }
+
+          if (!msg.content) continue;
+
+          const fileLinks = parseFileLinksFromMessage(msg.content, msg.id, sessionId);
+          for (const fl of fileLinks) {
+            const normalized = fl.filePath ? normalizeFilePathForDedup(fl.filePath) : '';
+            if (fl.filePath && !seenFilePaths.has(normalized)) {
+              seenFilePaths.add(normalized);
+              detected.push(fl);
+            }
+          }
+
+          const contentWithoutFileLinks = stripFileLinksFromText(msg.content);
+          const pathArtifacts = parseFilePathsFromText(contentWithoutFileLinks, msg.id, sessionId, 'artifact-system-path');
+          for (const pa of pathArtifacts) {
+            const normalized = pa.filePath ? normalizeFilePathForDedup(pa.filePath) : '';
+            if (pa.filePath && !seenFilePaths.has(normalized)) {
+              seenFilePaths.add(normalized);
+              detected.push(pa);
+            }
+          }
+
+          detected.push(...parseRemoteImageArtifactsFromText(msg.content, msg.id, sessionId, 'artifact-remote-system'));
         }
       }
 
@@ -1198,6 +1803,14 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
           const absPath = rawPath.startsWith('/')
             ? rawPath
             : (/^[A-Za-z]:/.test(rawPath) ? rawPath : `${cwd}/${rawPath}`);
+          if (artifact.type === 'video') {
+            loadedFileIdsRef.current.add(artifact.id);
+            dispatch(addArtifact({
+              sessionId,
+              artifact: { ...artifact, content: '', filePath: absPath },
+            }));
+            continue;
+          }
           if (artifact.type === ArtifactTypeValue.Html) {
             try {
               const stat = await window.electron.dialog.statFile(absPath);
@@ -1375,70 +1988,51 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     };
   }, [currentSession?.id]);
 
-  const sessionToMarkdown = useCallback((): string => {
-    if (!currentSession) return '';
-    const lines: string[] = [];
-    lines.push(`# ${currentSession.title}`);
-    lines.push('');
-    lines.push(`> ${i18nService.t('coworkExportCreatedAt')}: ${new Date(currentSession.createdAt).toLocaleString()}`);
-    lines.push('');
-    lines.push('---');
-    lines.push('');
-    for (const msg of currentSession.messages) {
-      if (msg.type === 'user') {
-        lines.push(`## 🧑 User`);
-        lines.push('');
-        lines.push(msg.content);
-        lines.push('');
-      } else if (msg.type === 'assistant') {
-        lines.push(`## 🤖 Assistant`);
-        lines.push('');
-        lines.push(msg.content);
-        lines.push('');
-      } else if (msg.type === 'tool_use' && msg.metadata?.toolName) {
-        lines.push(`### 🔧 Tool: ${msg.metadata.toolName}`);
-        lines.push('');
-        if (msg.metadata.toolInput) {
-          lines.push('```json');
-          lines.push(JSON.stringify(msg.metadata.toolInput, null, 2));
-          lines.push('```');
-          lines.push('');
-        }
-      } else if (msg.type === 'tool_result') {
-        lines.push('#### Tool Result');
-        lines.push('');
-        lines.push('```');
-        lines.push(msg.content.slice(0, 2000) + (msg.content.length > 2000 ? '\n... (truncated)' : ''));
-        lines.push('```');
-        lines.push('');
+  const loadTextExportMessages = useCallback(async (): Promise<CoworkMessage[]> => {
+    if (!currentSession) return [];
+
+    const loadedMessages = currentSession.messages;
+    const totalMessages = Math.max(currentSession.totalMessages ?? 0, loadedMessages.length);
+    const hasLoadedFullHistory = (currentSession.messagesOffset ?? 0) <= 0 && loadedMessages.length >= totalMessages;
+    if (hasLoadedFullHistory) {
+      return loadedMessages;
+    }
+
+    const result = await window.electron.cowork.getSessionMessages({
+      sessionId: currentSession.id,
+      limit: Math.max(totalMessages, 1),
+      offset: 0,
+    });
+    if (!result.success || !result.messages) {
+      throw new Error(result.error || 'Failed to load session messages for export');
+    }
+
+    let storedMessages = result.messages;
+    const returnedTotal = result.total ?? totalMessages;
+    if (returnedTotal > storedMessages.length) {
+      const retryResult = await window.electron.cowork.getSessionMessages({
+        sessionId: currentSession.id,
+        limit: returnedTotal,
+        offset: 0,
+      });
+      if (retryResult.success && retryResult.messages) {
+        storedMessages = retryResult.messages;
       }
     }
-    return lines.join('\n');
+
+    return mergeCoworkTextExportMessages(storedMessages, loadedMessages);
   }, [currentSession]);
 
-  const sessionToJSON = useCallback((): string => {
-    if (!currentSession) return '{}';
-    return JSON.stringify({
-      title: currentSession.title,
-      createdAt: new Date(currentSession.createdAt).toISOString(),
-      updatedAt: new Date(currentSession.updatedAt).toISOString(),
-      status: currentSession.status,
-      messages: currentSession.messages.map(msg => ({
-        type: msg.type,
-        content: msg.content,
-        timestamp: new Date(msg.timestamp).toISOString(),
-        ...(msg.metadata?.toolName ? { toolName: msg.metadata.toolName } : {}),
-        ...(msg.metadata?.toolInput ? { toolInput: msg.metadata.toolInput } : {}),
-      })),
-    }, null, 2);
-  }, [currentSession]);
-
-  const handleExportText = useCallback(async (format: 'md' | 'json') => {
-    if (!currentSession) return;
-    const content = format === 'md' ? sessionToMarkdown() : sessionToJSON();
+  const handleExportText = useCallback(async (format: CoworkTextExportFormatValue) => {
+    if (!currentSession || isExportingText) return;
+    setIsExportingText(true);
     const timestamp = new Date().toISOString().slice(0, 10);
     const fileName = sanitizeExportFileName(`${currentSession.title}-${timestamp}.${format}`);
     try {
+      const messages = await loadTextExportMessages();
+      const content = format === CoworkTextExportFormat.Markdown
+        ? buildCoworkSessionMarkdown(currentSession, messages, i18nService.t.bind(i18nService))
+        : buildCoworkSessionJSON(currentSession, messages);
       const result = await window.electron.cowork.exportSessionText({
         content,
         defaultFileName: fileName,
@@ -1456,8 +2050,10 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       window.dispatchEvent(new CustomEvent('app:showToast', {
         detail: i18nService.t('coworkExportTextFailed'),
       }));
+    } finally {
+      setIsExportingText(false);
     }
-  }, [currentSession, sessionToMarkdown, sessionToJSON]);
+  }, [currentSession, isExportingText, loadTextExportMessages]);
 
   const handleShareClick = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -1641,6 +2237,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
         isLoadingMoreMessagesRef.current = true;
         setIsLoadingMoreMessages(true);
         prevScrollHeightRef.current = container.scrollHeight;
+        logDetailDiagnostic(`loading older messages after scrolling near the top for session ${sessionId}; current offset is ${offset}.`);
         coworkService.loadMoreMessages(sessionId).catch(() => {
           prevScrollHeightRef.current = null;
           isLoadingMoreMessagesRef.current = false;
@@ -1712,6 +2309,9 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       isLoadingMoreMessagesRef.current = true;
       setIsLoadingMoreMessages(true);
       prevScrollHeightRef.current = container.scrollHeight;
+      logDetailDiagnostic(
+        `auto-loading older messages because session ${sessionId} content height ${container.scrollHeight} does not exceed viewport height ${container.clientHeight}; current offset is ${offset}.`,
+      );
       coworkService.loadMoreMessages(sessionId).catch(() => {
         prevScrollHeightRef.current = null;
         isLoadingMoreMessagesRef.current = false;
@@ -1816,20 +2416,62 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const handleReEdit = useCallback((message: CoworkMessage) => {
     const ref = promptInputRef.current;
     if (!ref) return;
-    // Set text content
-    if (message.content?.trim()) {
-      ref.setValue(message.content);
-    }
-    // Restore image attachments (always call to clear previous attachments)
-    const imageAttachments = ((message.metadata as CoworkMessageMetadata)?.imageAttachments ?? []) as CoworkImageAttachment[];
-    ref.setImageAttachments(imageAttachments);
-    // Restore active skills
-    const skillIds = (message.metadata as CoworkMessageMetadata)?.skillIds;
-    if (skillIds && skillIds.length > 0) {
+    void (async () => {
+      const metadata = message.metadata as CoworkMessageMetadata | undefined;
+      const imagePreviews = Array.isArray(metadata?.imageAttachmentPreviews)
+        ? metadata.imageAttachmentPreviews as CoworkImageAttachmentPreview[]
+        : [];
+      let imageAttachments = ((metadata?.imageAttachments ?? []) as CoworkImageAttachment[]);
+
+      if (imagePreviews.length > 0 && imageAttachments.length === 0) {
+        const restoredImages: CoworkImageAttachment[] = [];
+        for (const preview of imagePreviews) {
+          if (!preview.localPath) {
+            showToast(i18nService.t('coworkImageAttachmentOriginalMissing'));
+            return;
+          }
+          try {
+            const readResult = await window.electron.dialog.readFileAsDataUrl(preview.localPath);
+            if (!readResult.success || !readResult.dataUrl) {
+              showToast(i18nService.t('coworkImageAttachmentOriginalMissing'));
+              return;
+            }
+            const extracted = extractBase64FromDataUrl(readResult.dataUrl);
+            if (!extracted) {
+              showToast(i18nService.t('coworkImageAttachmentOriginalMissing'));
+              return;
+            }
+            restoredImages.push({
+              name: preview.name,
+              mimeType: extracted.mimeType,
+              base64Data: extracted.base64Data,
+              localPath: preview.localPath,
+            });
+          } catch (error) {
+            console.warn('[CoworkSessionDetail] failed to restore image attachment for re-edit:', error);
+            showToast(i18nService.t('coworkImageAttachmentOriginalMissing'));
+            return;
+          }
+        }
+        imageAttachments = restoredImages;
+      }
+
+      // Set text content
+      if (message.content?.trim()) {
+        ref.setValue(message.content);
+      }
+      // Restore image attachments (always call to clear previous attachments)
+      ref.setImageAttachments(imageAttachments);
+      const selectedTextSnippets = (metadata?.selectedTextSnippets ?? []) as CoworkSelectedTextSnippet[];
+      ref.setSelectedTextSnippets(selectedTextSnippets);
+      // Restore active skills
+      const skillIds = metadata?.skillIds ?? [];
       dispatch(setActiveSkillIds(skillIds));
-    }
-    // Focus the input
-    ref.focus();
+      const kitIds = metadata?.kitIds ?? [];
+      dispatch(setActiveKitIds(kitIds));
+      // Focus the input
+      ref.focus();
+    })();
   }, [dispatch]);
 
   const handleBrowserAnnotationCaptured = useCallback((payload: BrowserAnnotationPayload) => {
@@ -1907,13 +2549,38 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     return null;
   }
 
+  const defaultArtifactPanelContentWidth = Math.max(
+    artifactPanelMinWidth,
+    Math.min(panelWidth, artifactPanelMaxWidth),
+  );
+  const expandedArtifactPanelContentWidth = Math.max(
+    MIN_PANEL_WIDTH,
+    contentRowWidth - ARTIFACT_PANEL_RESIZE_HANDLE_WIDTH,
+  );
+  const artifactPanelContentWidth = isArtifactPanelExpanded
+    ? expandedArtifactPanelContentWidth
+    : defaultArtifactPanelContentWidth;
   const artifactPanelFrameWidth = isArtifactPanelVisible
-    ? Math.max(artifactPanelMinWidth, Math.min(panelWidth, artifactPanelMaxWidth)) + ARTIFACT_PANEL_RESIZE_HANDLE_WIDTH
+    ? artifactPanelContentWidth + ARTIFACT_PANEL_RESIZE_HANDLE_WIDTH
     : 0;
   const artifactHeaderWidth = isArtifactPanelVisible
-    ? Math.max(0, artifactPanelFrameWidth - ARTIFACT_PANEL_RESIZE_HANDLE_WIDTH)
+    ? isArtifactPanelExpanded && contentRowWidth > 0
+      ? contentRowWidth
+      : Math.max(0, artifactPanelFrameWidth - ARTIFACT_PANEL_RESIZE_HANDLE_WIDTH)
     : undefined;
+  const artifactPanelRenderMinWidth = isArtifactPanelExpanded
+    ? expandedArtifactPanelContentWidth
+    : artifactPanelMinWidth;
+  const artifactPanelRenderMaxWidth = isArtifactPanelExpanded
+    ? expandedArtifactPanelContentWidth
+    : artifactPanelMaxWidth;
+  const artifactPanelIsOverlay = isArtifactPanelVisible && isArtifactPanelExpanded;
+  const artifactPanelOverlayBottom = artifactPanelIsOverlay && !isExpandedPromptInputHidden
+    ? promptInputAreaHeight
+    : 0;
+  const artifactPanelInnerWidth = artifactPanelIsOverlay ? '100%' : artifactPanelFrameWidth;
   const shouldShowTurnNavigationRail = turns.length > 1 && isScrollable;
+  const expandedConversationPreview = getExpandedConversationPreview(currentSession.messages);
 
   const renderConversationTurns = () => {
     let railCounter = 0;
@@ -1943,14 +2610,11 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       const alwaysRender = index >= turns.length - 3;
 
       // Compute rail indices for user/assistant messages (must match rail IIFE logic)
-      let asstContent = '';
-      for (const item of turn.assistantItems) {
-        if (item.type === 'assistant' && item.message?.content) {
-          asstContent += item.message.content;
-        }
-      }
+      const hasAssistantContent = turn.assistantItems.some(
+        item => item.type === 'assistant' && Boolean(item.message?.content),
+      );
       const userRailIdx = turn.userMessage ? railCounter++ : -1;
-      const asstRailIdx = asstContent ? railCounter++ : -1;
+      const asstRailIdx = hasAssistantContent ? railCounter++ : -1;
 
       const turnMessageIds = new Set<string>();
       for (const item of turn.assistantItems) {
@@ -1971,7 +2635,13 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
         <LazyRenderTurn key={turn.id} turnId={turn.id} alwaysRender={alwaysRender} data-turn-index={index}>
           {turn.userMessage && (
             <div data-export-role="user-message" className={isLastTurn ? 'animate-message-in' : undefined} {...(userRailIdx >= 0 ? { 'data-rail-index': userRailIdx } : undefined)}>
-              <UserMessageItem message={turn.userMessage} skills={skills} onReEdit={remoteManaged ? undefined : handleReEdit} />
+              <UserMessageItem
+                message={turn.userMessage}
+                skills={skills}
+                marketplaceKits={marketplaceKits}
+                onReEdit={remoteManaged ? undefined : handleReEdit}
+                onLocateSelectedText={handleLocateSelectedText}
+              />
             </div>
           )}
           {showAssistantBlock && (
@@ -1982,6 +2652,8 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                 resolveLocalFilePath={resolveLocalFilePath}
                 mapDisplayText={mapDisplayText}
                 onOpenLocalService={handleOpenLocalServiceArtifact}
+                onOpenHtmlFile={handleOpenHtmlFileInBrowser}
+                onForkMessage={remoteManaged ? undefined : handleForkMessage}
                 showTypingIndicator={showTypingIndicator}
                 showCopyButtons={!isStreaming || !isLastTurn}
               />
@@ -1995,7 +2667,10 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden">
       {/* Header — spans full width */}
-      <div className="draggable flex h-12 items-center justify-between px-4 border-b border-border bg-background shrink-0">
+      <div className={`draggable flex h-12 items-center justify-between border-b border-border bg-background shrink-0 ${
+        isArtifactPanelExpanded ? 'pl-0 pr-4' : 'px-4'
+      }`}
+      >
         {/* Left side: Toggle buttons (when collapsed) + Title */}
         <div className="flex h-full flex-1 items-center gap-2 min-w-0">
           {isSidebarCollapsed && (
@@ -2024,8 +2699,12 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
 
         {/* Right side: Artifact toggle */}
         <div
-          className={`non-draggable flex h-full shrink-0 items-center gap-1 ${
-            isArtifactPanelVisible ? '-mr-4 border-l border-border pr-4' : ''
+          className={`flex h-full shrink-0 items-center gap-1 ${
+            isArtifactPanelVisible
+              ? isArtifactPanelExpanded
+                ? '-mr-4 pr-4'
+                : '-mr-4 border-l border-border pr-4'
+              : ''
           }`}
           style={artifactHeaderWidth !== undefined ? { width: artifactHeaderWidth } : undefined}
         >
@@ -2036,7 +2715,10 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                   ref={artifactTabsScrollRef}
                   className="scrollbar-hidden flex h-full min-w-0 flex-1 overflow-x-auto overflow-y-hidden"
                 >
-                  <div className="flex h-full min-w-max items-center gap-1 pl-4 pr-3">
+                  <div className={`flex h-full min-w-max items-center gap-1 pr-3 ${
+                    isArtifactPanelExpanded ? 'pl-3' : 'pl-4'
+                  }`}
+                  >
                   {isFileListPreviewTabOpen && (
                     <div
                       data-artifact-preview-active={
@@ -2044,7 +2726,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                           ? 'true'
                           : undefined
                       }
-                      className={`group flex h-7 max-w-[190px] items-center rounded-lg text-xs transition-colors ${
+                      className={`non-draggable group flex h-7 max-w-[190px] items-center rounded-lg text-xs transition-colors ${
                         activeArtifactPreviewTab || activeSpecialPreviewTab !== ArtifactSpecialTab.FileList
                           ? 'text-secondary hover:bg-surface hover:text-foreground'
                           : 'bg-surface-raised text-foreground shadow-sm'
@@ -2083,7 +2765,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                           ? 'true'
                           : undefined
                       }
-                      className={`group flex h-7 max-w-[190px] items-center rounded-lg text-xs transition-colors ${
+                      className={`non-draggable group flex h-7 max-w-[190px] items-center rounded-lg text-xs transition-colors ${
                         activeArtifactPreviewTab || activeSpecialPreviewTab !== ArtifactSpecialTab.Browser
                           ? 'text-secondary hover:bg-surface hover:text-foreground'
                           : 'bg-surface-raised text-foreground shadow-sm'
@@ -2122,7 +2804,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                       <div
                         key={tab.id}
                         data-artifact-preview-active={isActive ? 'true' : undefined}
-                        className={`group flex h-7 max-w-[190px] shrink-0 items-center rounded-lg text-xs transition-colors ${
+                        className={`non-draggable group flex h-7 max-w-[190px] shrink-0 items-center rounded-lg text-xs transition-colors ${
                           isActive
                             ? 'bg-surface-raised text-foreground shadow-sm'
                             : 'text-secondary hover:bg-surface hover:text-foreground'
@@ -2163,7 +2845,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                         ref={artifactAddButtonRef}
                         type="button"
                         onClick={handleToggleArtifactAddMenu}
-                        className={`inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-secondary transition-colors hover:bg-surface hover:text-foreground ${
+                        className={`non-draggable inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-secondary transition-colors hover:bg-surface hover:text-foreground ${
                           showArtifactAddMenu ? 'bg-surface text-foreground' : ''
                         }`}
                         aria-label={i18nService.t('artifactAddTab')}
@@ -2181,7 +2863,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                       ref={artifactAddButtonRef}
                       type="button"
                       onClick={handleToggleArtifactAddMenu}
-                      className={`inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-secondary transition-colors hover:bg-surface hover:text-foreground ${
+                      className={`non-draggable inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-secondary transition-colors hover:bg-surface hover:text-foreground ${
                         showArtifactAddMenu ? 'bg-surface text-foreground' : ''
                       }`}
                       aria-label={i18nService.t('artifactAddTab')}
@@ -2205,10 +2887,37 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
             </div>
           )}
           {/* Artifact panel toggle */}
+          {isPanelOpen && (
+            <button
+              type="button"
+              onClick={handleToggleArtifactPanelExpanded}
+              className={`non-draggable relative inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
+                isArtifactPanelExpanded
+                  ? 'bg-surface-raised text-foreground hover:bg-surface-hover'
+                  : 'text-secondary hover:bg-surface-raised hover:text-foreground'
+              }`}
+              aria-label={
+                isArtifactPanelExpanded
+                  ? i18nService.t('artifactBrowserRestorePanelWidth')
+                  : i18nService.t('artifactBrowserExpandPanel')
+              }
+              title={
+                isArtifactPanelExpanded
+                  ? i18nService.t('artifactBrowserRestorePanelWidth')
+                  : i18nService.t('artifactBrowserExpandPanel')
+              }
+            >
+              {isArtifactPanelExpanded ? (
+                <PanelRestoreIcon className="h-4 w-4" />
+              ) : (
+                <PanelExpandIcon className="h-4 w-4" />
+              )}
+            </button>
+          )}
           <button
             type="button"
             onClick={handleToggleArtifactPanel}
-            className="relative h-8 w-8 inline-flex items-center justify-center rounded-lg text-secondary hover:bg-surface-raised transition-colors"
+            className="non-draggable relative h-8 w-8 inline-flex items-center justify-center rounded-lg text-secondary hover:bg-surface-raised transition-colors"
             aria-label={i18nService.t('artifactPanelToggle')}
           >
             <ArtifactPanelIcon className="h-4 w-4" open={isPanelOpen} />
@@ -2274,8 +2983,9 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
               </button>
               <button
                 type="button"
-                onClick={() => { setShowExportOptions(false); handleExportText('md'); }}
-                className="w-full flex items-center gap-3 px-5 py-3 text-left text-sm dark:text-claude-darkText text-claude-text hover:bg-claude-surfaceHover dark:hover:bg-claude-darkSurfaceHover transition-colors"
+                onClick={() => { setShowExportOptions(false); handleExportText(CoworkTextExportFormat.Markdown); }}
+                disabled={isExportingText}
+                className="w-full flex items-center gap-3 px-5 py-3 text-left text-sm dark:text-claude-darkText text-claude-text hover:bg-claude-surfaceHover dark:hover:bg-claude-darkSurfaceHover transition-colors disabled:opacity-50"
               >
                 <DocumentArrowDownIcon className="h-5 w-5 dark:text-claude-darkTextSecondary text-claude-textSecondary" />
                 <div>
@@ -2285,8 +2995,9 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
               </button>
               <button
                 type="button"
-                onClick={() => { setShowExportOptions(false); handleExportText('json'); }}
-                className="w-full flex items-center gap-3 px-5 py-3 text-left text-sm dark:text-claude-darkText text-claude-text hover:bg-claude-surfaceHover dark:hover:bg-claude-darkSurfaceHover transition-colors"
+                onClick={() => { setShowExportOptions(false); handleExportText(CoworkTextExportFormat.Json); }}
+                disabled={isExportingText}
+                className="w-full flex items-center gap-3 px-5 py-3 text-left text-sm dark:text-claude-darkText text-claude-text hover:bg-claude-surfaceHover dark:hover:bg-claude-darkSurfaceHover transition-colors disabled:opacity-50"
               >
                 <DocumentArrowDownIcon className="h-5 w-5 dark:text-claude-darkTextSecondary text-claude-textSecondary" />
                 <div>
@@ -2300,15 +3011,31 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       )}
 
       {/* Content row: chat + artifact panel */}
-      <div ref={contentRowRef} className="flex-1 flex overflow-hidden">
-      <div ref={detailRootRef} className="flex-1 flex flex-col bg-background h-full" style={{ minWidth: COWORK_DETAIL_MIN_WIDTH }}>
+      <div ref={contentRowRef} className="relative flex-1 flex overflow-hidden">
+      <div
+        ref={detailRootRef}
+        className="flex-1 flex flex-col bg-background h-full min-w-0"
+        style={{ minWidth: isArtifactPanelExpanded ? 0 : COWORK_DETAIL_MIN_WIDTH }}
+      >
       <div className="relative flex-1 min-h-0">
         <div
           ref={scrollContainerRef}
           onScroll={handleMessagesScroll}
-          className="h-full min-h-0 overflow-y-auto pt-3"
+          onMouseUp={handleAssistantTextSelection}
+          className="relative h-full min-h-0 overflow-y-auto pt-3"
           style={{ scrollbarGutter: 'stable both-edges' }}
         >
+          {selectedTextAction && (
+            <button
+              type="button"
+              data-cowork-selected-text-action
+              onClick={handleAddSelectedText}
+              className="absolute z-40 -translate-x-1/2 rounded-full border border-border bg-surface px-3 py-1.5 text-xs font-medium text-foreground shadow-popover transition-colors hover:bg-surface-raised"
+              style={{ left: selectedTextAction.left, top: selectedTextAction.top }}
+            >
+              {i18nService.t('coworkSelectedTextAddToChat')}
+            </button>
+          )}
           {isLoadingMoreMessages && (
             <div className="py-2 text-center text-xs dark:text-claude-darkTextSecondary text-claude-textSecondary">
               {i18nService.t('loading')}
@@ -2540,7 +3267,103 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       {isSessionBusy && <StreamingActivityBar messages={currentSession.messages} isContextMaintenance={isContextMaintenance} />}
 
       {/* Input Area */}
-      <div className={`pt-0 pb-4 shrink-0 ${COWORK_DETAIL_GUTTER_CLASS}`}>
+      <div
+        ref={promptInputAreaRef}
+        className={`relative shrink-0 ${COWORK_DETAIL_GUTTER_CLASS} ${
+          isArtifactPanelExpanded ? 'z-50 bg-background pb-2 pt-1' : 'pb-4 pt-0'
+        } ${isArtifactPanelExpanded && isExpandedPromptInputHidden ? 'hidden' : ''}`}
+      >
+        {isArtifactPanelExpanded && !isExpandedPromptInputHidden && (
+          <button
+            type="button"
+            onClick={handleToggleExpandedPromptInput}
+            className="absolute right-3 top-1 z-20 inline-flex h-5 w-5 items-center justify-center rounded-md border border-border bg-surface-raised text-muted shadow-sm transition-colors hover:bg-surface-hover hover:text-foreground"
+            aria-label={i18nService.t('artifactBrowserHideInput')}
+            title={i18nService.t('artifactBrowserHideInput')}
+          >
+            <PromptInputCollapseIcon className="h-3.5 w-3.5" />
+          </button>
+        )}
+        {isArtifactPanelExpanded && (expandedConversationPreview || isSessionBusy) && (
+          <div className={`${COWORK_DETAIL_CONTENT_CLASS} mb-1`}>
+            <div className="overflow-hidden rounded-2xl border border-border bg-surface-raised shadow-subtle">
+              <button
+                type="button"
+                onClick={() => setIsExpandedConversationPreviewOpen(value => !value)}
+                className="flex h-8 w-full items-center gap-2 px-3 pr-8 text-left text-xs text-secondary transition-colors hover:bg-surface-hover hover:text-foreground"
+                aria-label={i18nService.t(
+                  isExpandedConversationPreviewOpen
+                    ? 'coworkExpandedConversationPreviewCollapse'
+                    : 'coworkExpandedConversationPreviewExpand',
+                )}
+                title={i18nService.t(
+                  isExpandedConversationPreviewOpen
+                    ? 'coworkExpandedConversationPreviewCollapse'
+                    : 'coworkExpandedConversationPreviewExpand',
+                )}
+              >
+                <span className="shrink-0 font-medium text-muted">
+                  {i18nService.t(
+                    isExpandedConversationPreviewOpen
+                      ? 'coworkExpandedConversationPreviewMessages'
+                      : 'coworkExpandedConversationPreviewLatest',
+                  )}
+                </span>
+                <span className="min-w-0 flex-1 truncate">
+                  {expandedConversationPreview?.latest.summary ?? i18nService.t('coworkExpandedConversationPreviewEmpty')}
+                </span>
+                {isSessionBusy && (
+                  <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium leading-4 text-primary">
+                    <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" aria-hidden="true" />
+                    {i18nService.t('coworkExpandedConversationStatusRunning')}
+                  </span>
+                )}
+                {isExpandedConversationPreviewOpen ? (
+                  <PromptInputExpandIcon className="h-3.5 w-3.5 shrink-0 text-muted" />
+                ) : (
+                  <PromptInputCollapseIcon className="h-3.5 w-3.5 shrink-0 text-muted" />
+                )}
+              </button>
+              {isExpandedConversationPreviewOpen && (
+                <div className="max-h-44 overflow-y-auto border-t border-border/70 px-3 py-2">
+                  <div className="space-y-2">
+                    {expandedConversationPreview?.items.map(item => (
+                      <div
+                        key={item.id}
+                        className={`flex ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                      >
+                        <div
+                          className={
+                            item.role === 'user'
+                              ? 'max-w-[82%] rounded-2xl bg-background px-3 py-2 text-foreground shadow-subtle'
+                              : 'min-w-0 flex-1 px-1 py-1 text-foreground'
+                          }
+                        >
+                          <MarkdownContent
+                            content={item.content}
+                            className={
+                              item.role === 'user'
+                                ? 'max-w-none whitespace-pre-wrap break-words text-xs leading-5'
+                                : 'prose dark:prose-invert max-w-none text-xs leading-5'
+                            }
+                            resolveLocalFilePath={resolveLocalFilePath}
+                            showRevealInFolderAction={item.role === 'assistant'}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                    {isSessionBusy && (
+                      <div className="flex items-center gap-2 rounded-xl bg-primary/10 px-2.5 py-2 text-xs font-medium text-primary">
+                        <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" aria-hidden="true" />
+                        {i18nService.t('coworkExpandedConversationStatusRunning')}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
         <div className={COWORK_DETAIL_CONTENT_CLASS}>
           <CoworkPromptInput
             ref={promptInputRef}
@@ -2549,12 +3372,13 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
             isStreaming={isSessionBusy}
             placeholder={i18nService.t(remoteManaged ? 'coworkRemoteManagedPlaceholder' : 'coworkContinuePlaceholder')}
             disabled={remoteManaged}
-            size="large"
+            size={isArtifactPanelExpanded ? 'compact' : 'large'}
             remoteManaged={remoteManaged}
             onManageSkills={remoteManaged ? undefined : onManageSkills}
+            onManageKits={remoteManaged ? undefined : onManageKits}
             showModelSelector={true}
-            showReadOnlyContext={true}
-            readOnlyContextTrailingText={i18nService.t('aiGeneratedDisclaimer')}
+            showReadOnlyContext={!isArtifactPanelExpanded}
+            readOnlyContextTrailingText={isArtifactPanelExpanded ? undefined : i18nService.t('aiGeneratedDisclaimer')}
             workingDirectory={currentSession?.cwd ?? ''}
             contextAgentId={currentSession?.agentId}
             sessionId={currentSession?.id}
@@ -2592,38 +3416,64 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
           />
         </div>
       </div>
+      {isArtifactPanelExpanded && isExpandedPromptInputHidden && (
+        <button
+          type="button"
+          onClick={handleToggleExpandedPromptInput}
+          className="absolute bottom-2 right-2 z-50 inline-flex h-5 w-5 items-center justify-center rounded-md border border-border bg-surface-raised text-muted shadow-sm transition-colors hover:bg-surface-hover hover:text-foreground"
+          aria-label={i18nService.t('artifactBrowserShowInput')}
+          title={i18nService.t('artifactBrowserShowInput')}
+        >
+          <PromptInputExpandIcon className="h-3.5 w-3.5" />
+        </button>
+      )}
     </div>
     {shouldRenderArtifactPanel && (
       <div
-        className={`h-full shrink-0 overflow-hidden ${
+        className={`${
+          artifactPanelIsOverlay
+            ? 'absolute inset-x-0 top-0 z-40 overflow-hidden bg-background'
+            : 'h-full shrink-0 overflow-hidden'
+        } ${
           isArtifactPanelTransitioning
             ? 'transition-[width,opacity] duration-200 ease-out motion-reduce:transition-none'
             : ''
         } ${isArtifactPanelVisible ? 'opacity-100' : 'pointer-events-none opacity-0'}`}
-        style={{
-          width: artifactPanelFrameWidth,
-          maxWidth: artifactPanelMaxWidth + ARTIFACT_PANEL_RESIZE_HANDLE_WIDTH,
-        }}
+        style={artifactPanelIsOverlay
+          ? {
+              bottom: artifactPanelOverlayBottom,
+              width: 'auto',
+              maxWidth: 'none',
+            }
+          : {
+              width: artifactPanelFrameWidth,
+              maxWidth: artifactPanelMaxWidth + ARTIFACT_PANEL_RESIZE_HANDLE_WIDTH,
+            }}
         aria-hidden={!isPanelOpen}
       >
         <div
           className="flex h-full"
-          style={{ width: artifactPanelFrameWidth }}
+          style={{ width: artifactPanelInnerWidth }}
         >
           <ArtifactPanelErrorBoundary onClose={() => dispatch(closePanel({ sessionId: currentSession.id }))}>
             <ArtifactPanel
               sessionId={currentSession.id}
               artifacts={sessionArtifacts}
               activeSpecialTab={activeSpecialPreviewTab}
-              minPanelWidth={artifactPanelMinWidth}
-              maxPanelWidth={artifactPanelMaxWidth}
+              minPanelWidth={artifactPanelRenderMinWidth}
+              maxPanelWidth={artifactPanelRenderMaxWidth}
+              isPanelExpanded={isArtifactPanelExpanded}
               browserAddress={browserPreviewAddress}
               browserUrl={browserPreviewUrl}
+              browserHtmlArtifactId={browserHtmlPreviewArtifactId}
               onBrowserAddressChange={handleBrowserPreviewAddressChange}
               onBrowserUrlChange={handleBrowserPreviewUrlChange}
               onOpenFileListTab={handleOpenArtifactFileListTab}
               onOpenBrowserTab={handleOpenArtifactBrowserTab}
+              onOpenHtmlFileInBrowser={handleOpenHtmlFileInBrowser}
               onBrowserAnnotationCaptured={handleBrowserAnnotationCaptured}
+              onAddSelectedText={addSelectedTextSnippetToDraft}
+              selectedTextEnabled={!remoteManaged}
             />
           </ArtifactPanelErrorBoundary>
         </div>

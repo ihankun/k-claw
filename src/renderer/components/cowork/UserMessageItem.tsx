@@ -1,13 +1,20 @@
 import { PhotoIcon } from '@heroicons/react/24/outline';
 import React, { useCallback, useMemo, useState } from 'react';
 
+import type { CoworkImageAttachmentPreview } from '../../../shared/cowork/imageAttachments';
+import type { CoworkSelectedTextSnippet } from '../../../shared/cowork/selectedText';
+import type { KitReference } from '../../../shared/kit/constants';
+import { copyTextToClipboard } from '../../services/clipboard';
 import { i18nService } from '../../services/i18n';
+import { buildKitReferences } from '../../services/kitCapability';
 import type { CoworkImageAttachment, CoworkMessage, CoworkMessageMetadata } from '../../types/cowork';
+import type { MarketplaceKit } from '../../types/kit';
 import type { Skill } from '../../types/skill';
 import { formatMessageDateTime } from '../../utils/tokenFormat';
 import { parseUserMessageForDisplay } from '../../utils/userMessageDisplay';
 import EditIcon from '../icons/EditIcon';
 import MessageCopyIcon from '../icons/MessageCopyIcon';
+import SidebarKitsIcon from '../icons/SidebarKitsIcon';
 import SkillIcon from '../icons/SkillIcon';
 import MarkdownContent from '../MarkdownContent';
 import ImagePreviewModal, { type ImagePreviewSource } from './ImagePreviewModal';
@@ -17,6 +24,7 @@ import {
   getMessageModelLabel,
   messageMetaClassName,
 } from './messageDisplayUtils';
+import SelectedTextSnippetBadge from './SelectedTextSnippetBadge';
 
 // ── CopyButton (local) ──────────────────────────────────────────────────────
 
@@ -28,17 +36,16 @@ const CopyButton: React.FC<{
 
   const handleCopy = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    try {
-      await navigator.clipboard.writeText(content);
+    const copiedToClipboard = await copyTextToClipboard(content);
+    if (copiedToClipboard) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      console.error('Failed to copy:', err);
     }
   };
 
   return (
     <button
+      type="button"
       onClick={handleCopy}
       className={`p-1.5 rounded-md hover:bg-surface-raised transition-all duration-200 ${
         visible ? 'opacity-100' : 'opacity-0 pointer-events-none'
@@ -116,13 +123,53 @@ const UserMessageSkillBadges: React.FC<{ skills: Skill[] }> = ({ skills }) => {
   );
 };
 
+const UserMessageKitBadges: React.FC<{ kitReferences: KitReference[] }> = ({ kitReferences }) => {
+  if (kitReferences.length === 0) return null;
+
+  return (
+    <>
+      {kitReferences.map(kitReference => {
+        const displayName = kitReference.name?.trim() || `@${kitReference.id}`;
+        return (
+          <div
+            key={kitReference.uri || kitReference.id}
+            className="inline-flex h-7 max-w-[240px] items-center gap-1.5 rounded-md bg-primary-muted px-2.5 text-[13px] font-normal leading-none text-foreground"
+            title={kitReference.uri}
+          >
+            <SidebarKitsIcon className="h-3.5 w-3.5 shrink-0 text-primary" />
+            <span className="min-w-0 truncate">
+              {displayName}
+            </span>
+          </div>
+        );
+      })}
+    </>
+  );
+};
+
+const UserMessageCapabilityBadges: React.FC<{
+  kitReferences: KitReference[];
+  skills: Skill[];
+}> = ({ kitReferences, skills }) => {
+  if (kitReferences.length === 0 && skills.length === 0) return null;
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <UserMessageKitBadges kitReferences={kitReferences} />
+      <UserMessageSkillBadges skills={skills} />
+    </div>
+  );
+};
+
 // ── UserMessageItem ──────────────────────────────────────────────────────────
 
 const UserMessageItem: React.FC<{
   message: CoworkMessage;
   skills: Skill[];
+  marketplaceKits?: MarketplaceKit[];
   onReEdit?: (message: CoworkMessage) => void;
-}> = React.memo(({ message, skills, onReEdit }) => {
+  onLocateSelectedText?: (sourceMessageId: string) => void;
+}> = React.memo(({ message, skills, marketplaceKits = [], onReEdit, onLocateSelectedText }) => {
   const [isHovered, setIsHovered] = useState(false);
   const [expandedImage, setExpandedImage] = useState<ImagePreviewSource | null>(null);
   const modelLabel = getMessageModelLabel(message.metadata);
@@ -143,12 +190,26 @@ const UserMessageItem: React.FC<{
     [message.content]
   );
 
-  const messageSkillIds = (message.metadata as CoworkMessageMetadata)?.skillIds || [];
+  const metadata = message.metadata as CoworkMessageMetadata | undefined;
+  const messageSkillIds = Array.isArray(metadata?.skillIds) ? metadata.skillIds : [];
   const messageSkills = messageSkillIds
     .map(id => skills.find(s => s.id === id))
     .filter((s): s is NonNullable<typeof s> => s !== undefined);
+  const metadataKitReferences = Array.isArray(metadata?.kitReferences) ? metadata.kitReferences : [];
+  const messageKitIds = Array.isArray(metadata?.kitIds) ? metadata.kitIds : [];
+  const messageKitReferences = metadataKitReferences.length > 0
+    ? metadataKitReferences
+    : buildKitReferences(messageKitIds, marketplaceKits);
 
-  const imageAttachments = ((message.metadata as CoworkMessageMetadata)?.imageAttachments ?? []) as CoworkImageAttachment[];
+  const selectedTextSnippets = (metadata?.selectedTextSnippets ?? []) as CoworkSelectedTextSnippet[];
+  const imageAttachmentPreviews = Array.isArray(metadata?.imageAttachmentPreviews)
+    ? metadata.imageAttachmentPreviews as CoworkImageAttachmentPreview[]
+    : [];
+  const legacyImageAttachments = (metadata?.imageAttachments ?? []) as CoworkImageAttachment[];
+  const displayImageAttachments = imageAttachmentPreviews.length > 0
+    ? imageAttachmentPreviews
+    : legacyImageAttachments;
+  const hasCapabilityBadges = messageKitReferences.length > 0 || messageSkills.length > 0;
 
   return (
     <div
@@ -164,9 +225,21 @@ const UserMessageItem: React.FC<{
           <div className="flex items-start gap-3 flex-row-reverse">
             <div className="w-full min-w-0 flex flex-col items-end">
               <div className="w-fit max-w-full rounded-2xl px-4 py-2.5 bg-surface text-foreground shadow-subtle">
-                {messageSkills.length > 0 && (
-                  <div className={(displayContent?.trim() || imageAttachments.length > 0) ? 'mb-2' : ''}>
-                    <UserMessageSkillBadges skills={messageSkills} />
+                {selectedTextSnippets.length > 0 && (
+                  <div className={(displayContent?.trim() || displayImageAttachments.length > 0 || hasCapabilityBadges) ? 'mb-2' : ''}>
+                    <SelectedTextSnippetBadge
+                      snippets={selectedTextSnippets}
+                      align="right"
+                      onLocate={onLocateSelectedText}
+                    />
+                  </div>
+                )}
+                {hasCapabilityBadges && (
+                  <div className={(displayContent?.trim() || displayImageAttachments.length > 0) ? 'mb-2' : ''}>
+                    <UserMessageCapabilityBadges
+                      kitReferences={messageKitReferences}
+                      skills={messageSkills}
+                    />
                   </div>
                 )}
                 {displayContent?.trim() && (
@@ -176,9 +249,9 @@ const UserMessageItem: React.FC<{
                     onImageClick={setExpandedImage}
                   />
                 )}
-                {imageAttachments.length > 0 && (
+                {displayImageAttachments.length > 0 && (
                   <div className={`flex flex-wrap gap-2 ${displayContent?.trim() ? 'mt-2' : ''}`}>
-                    {imageAttachments.map((img, idx) => (
+                    {displayImageAttachments.map((img, idx) => (
                       <div key={idx} className="relative group">
                         <img
                           src={`data:${img.mimeType};base64,${img.base64Data}`}

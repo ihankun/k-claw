@@ -6,6 +6,7 @@ import {
   getCustomProviderDefaultName,
   getProviderDisplayName,
   isCustomProvider,
+  ShortcutAction,
 } from './config';
 
 test('isCustomProvider: custom_0 is custom', () => {
@@ -76,4 +77,41 @@ test('defaultConfig uses OpenAI-compatible DeepSeek defaults', () => {
   expect(defaultConfig.api.baseUrl).toBe('https://api.deepseek.com');
   expect(defaultConfig.providers?.[ProviderName.DeepSeek]?.apiFormat).toBe(ApiFormat.OpenAI);
   expect(defaultConfig.providers?.[ProviderName.Xiaomi]?.apiFormat).toBe(ApiFormat.OpenAI);
+});
+
+test('defaultConfig gives DeepSeek V4 models 1M context', () => {
+  expect(defaultConfig.providers?.[ProviderName.DeepSeek]?.models?.slice(0, 2)).toEqual([
+    { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', supportsImage: false, contextWindow: 1_000_000 },
+    { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', supportsImage: false, contextWindow: 1_000_000 },
+  ]);
+});
+
+test('defaultConfig limits Xiaomi models to V2.5 with 1M context', () => {
+  expect(defaultConfig.providers?.[ProviderName.Xiaomi]?.models).toEqual([
+    { id: 'mimo-v2.5-pro', name: 'MiMo V2.5 Pro', supportsImage: false, contextWindow: 1_000_000 },
+    { id: 'mimo-v2.5', name: 'MiMo V2.5', supportsImage: true, contextWindow: 1_000_000 },
+  ]);
+});
+
+test('defaultConfig puts MiniMax M3 first with 1M context', () => {
+  expect(defaultConfig.providers?.[ProviderName.Minimax]?.models?.[0]).toMatchObject({
+    id: 'MiniMax-M3',
+    name: 'MiniMax M3',
+    contextWindow: 1_000_000,
+  });
+});
+
+test('defaultConfig leaves agent shortcuts unset', () => {
+  expect(defaultConfig.shortcuts?.[ShortcutAction.PreviousAgent]).toBe('');
+  expect(defaultConfig.shortcuts?.[ShortcutAction.NextAgent]).toBe('');
+  expect(defaultConfig.shortcuts?.[ShortcutAction.ShowCurrentAgentTasks]).toBe('');
+  expect(defaultConfig.shortcuts?.[ShortcutAction.OpenAgentTask1]).toBe('');
+  expect(defaultConfig.shortcuts?.[ShortcutAction.OpenAgentTask2]).toBe('');
+  expect(defaultConfig.shortcuts?.[ShortcutAction.OpenAgentTask3]).toBe('');
+  expect(defaultConfig.shortcuts?.[ShortcutAction.OpenAgentTask4]).toBe('');
+  expect(defaultConfig.shortcuts?.[ShortcutAction.OpenAgentTask5]).toBe('');
+  expect(defaultConfig.shortcuts?.[ShortcutAction.OpenAgentTask6]).toBe('');
+  expect(defaultConfig.shortcuts?.[ShortcutAction.OpenAgentTask7]).toBe('');
+  expect(defaultConfig.shortcuts?.[ShortcutAction.OpenAgentTask8]).toBe('');
+  expect(defaultConfig.shortcuts?.[ShortcutAction.OpenAgentTask9]).toBe('');
 });

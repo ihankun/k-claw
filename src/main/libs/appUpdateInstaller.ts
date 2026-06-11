@@ -1,5 +1,5 @@
-import { app, session } from 'electron';
-import { exec, spawn } from 'child_process';
+import { exec } from 'child_process';
+import { app, session, shell } from 'electron';
 import fs from 'fs';
 import path from 'path';
 import { Readable } from 'stream';
@@ -361,76 +361,26 @@ async function installMacDmg(dmgPath: string): Promise<void> {
 }
 
 async function installWindowsNsis(exePath: string): Promise<void> {
-  console.log(`[AppUpdate] Windows NSIS install (interactive mode)`);
-  console.log(`[AppUpdate]   installer: ${exePath}`);
-  console.log(`[AppUpdate]   appPid: ${process.pid}`);
-
-  // We must NOT spawn the installer directly as a child of the app, because
-  // the NSIS customInit macro runs `taskkill /IM "LobsterAI.exe" /F /T`
-  // which kills the entire process tree — including child processes.
+  // Launch the installer while the app still owns the foreground so the UAC
+  // elevation prompt (the installer requests admin) appears in front of the
+  // user. Launching it from a hidden background process after the app exited
+  // left the prompt flashing in the taskbar where users never noticed it, so
+  // the elevation timed out and the update silently went nowhere.
   //
-  // Strategy: use a tiny PowerShell script (launched via hidden VBS) that
-  // waits for the app to fully exit, then opens the installer with its
-  // normal UI (no /S silent flag). This lets NSIS handle everything:
-  // desktop shortcuts, start menu entries, "Run after finish", etc.
-  const ts = Date.now();
-  const tempDir = app.getPath('temp');
-  const logPath = path.join(tempDir, `lobsterai-update-${ts}.log`);
-  const scriptPath = path.join(tempDir, `lobsterai-update-${ts}.ps1`);
-  const vbsPath = path.join(tempDir, `lobsterai-update-${ts}.vbs`);
+  // Quitting in parallel with the installer starting is safe: the NSIS
+  // customInit macro stops remaining LobsterAI processes by image name and
+  // polls until they are gone before replacing files. The installer process
+  // itself is named lobsterai-update-*, so it is not affected by that kill.
+  console.log(`[AppUpdate] Launching Windows installer in the foreground: ${exePath}`);
+  const launchError = await shell.openPath(exePath);
+  if (launchError) {
+    console.error(`[AppUpdate] failed to launch installer: ${launchError}`);
+    // Leave the user a manual path instead of failing silently: reveal the
+    // downloaded installer in Explorer so they can double-click it.
+    shell.showItemInFolder(exePath);
+    throw new Error(launchError);
+  }
 
-  console.log(`[AppUpdate] Script log: ${logPath}`);
-
-  const psEscape = (s: string) => s.replace(/'/g, "''");
-
-  const psScript = [
-    `$logPath = '${psEscape(logPath)}'`,
-    `$appPid = ${process.pid}`,
-    `$installerPath = '${psEscape(exePath)}'`,
-    '',
-    'function Log($msg) {',
-    "    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'",
-    '    Add-Content -Path $logPath -Value "[$ts] $msg" -Encoding UTF8',
-    '}',
-    '',
-    'try {',
-    '    Log "Update script started (appPid=$appPid)"',
-    '',
-    '    # Wait for the app to fully exit (by PID, max 120s)',
-    '    $waited = 0',
-    '    while ($waited -lt 120) {',
-    '        try {',
-    '            Get-Process -Id $appPid -ErrorAction Stop | Out-Null',
-    '            Start-Sleep -Seconds 1',
-    '            $waited++',
-    '        } catch {',
-    '            break',
-    '        }',
-    '    }',
-    '    Log "App exited after $waited seconds"',
-    '',
-    '    # Launch installer with normal UI (NSIS handles shortcuts & relaunch)',
-    '    Log "Launching installer: $installerPath"',
-    '    Start-Process -FilePath $installerPath',
-    '    Log "Done"',
-    '} catch {',
-    '    Log "ERROR: $($_.Exception.Message)"',
-    '}',
-  ].join('\r\n');
-
-  await fs.promises.writeFile(scriptPath, '\ufeff' + psScript, 'utf-8');
-
-  const vbsScript = `CreateObject("WScript.Shell").Run "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File ""${scriptPath}""", 0, False`;
-  await fs.promises.writeFile(vbsPath, vbsScript, 'utf-8');
-
-  console.log('[AppUpdate] Launching installer via wscript.exe...');
-
-  const launcher = spawn('wscript.exe', [vbsPath], {
-    detached: true,
-    stdio: 'ignore',
-  });
-  launcher.unref();
-
-  console.log(`[AppUpdate] Launcher PID: ${launcher.pid}, calling app.quit()`);
+  console.log('[AppUpdate] Installer launched, quitting app');
   app.quit();
 }

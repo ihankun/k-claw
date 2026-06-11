@@ -6,8 +6,22 @@ import os from 'os';
 import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 
+import { CoworkSystemMessageKind } from '../common/coworkSystemMessages';
 import { AgentId, normalizeAgentAvatarIcon } from '../shared/agent';
-import { COWORK_MESSAGE_PAGE_SIZE, COWORK_SESSION_PAGE_SIZE } from '../shared/cowork/constants';
+import {
+  COWORK_MESSAGE_PAGE_SIZE,
+  COWORK_SESSION_PAGE_SIZE,
+  CoworkForkMode,
+  type CoworkForkMode as CoworkForkModeType,
+} from '../shared/cowork/constants';
+import {
+  type CoworkSelectedTextSnippet,
+  CoworkSelectedTextSource,
+} from '../shared/cowork/selectedText';
+import type {
+  KitReference,
+  ResolvedKitCapabilities,
+} from '../shared/kit/constants';
 
 
 // Default working directory for new users
@@ -378,6 +392,9 @@ export interface CoworkMessageMetadata {
   isStreaming?: boolean;
   isFinal?: boolean;
   skillIds?: string[];
+  kitIds?: string[];
+  kitReferences?: KitReference[];
+  resolvedKitCapabilities?: ResolvedKitCapabilities;
   usage?: {
     inputTokens?: number;
     outputTokens?: number;
@@ -387,6 +404,7 @@ export interface CoworkMessageMetadata {
   contextPercent?: number;
   model?: string;
   agentName?: string;
+  selectedTextSnippets?: CoworkSelectedTextSnippet[];
   [key: string]: unknown;
 }
 
@@ -423,6 +441,13 @@ export interface CoworkSession {
   messagesOffset: number;
   /** Total number of messages stored for this session. */
   totalMessages: number;
+  parentSessionId?: string | null;
+  forkedFromMessageId?: string | null;
+  forkedAt?: number | null;
+  forkMode?: CoworkForkModeType;
+  forkWorkspacePath?: string | null;
+  forkGitBranch?: string | null;
+  forkGitBaseRef?: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -434,6 +459,9 @@ export interface CoworkSessionSummary {
   pinned: boolean;
   pinOrder?: number | null;
   agentId: string;
+  parentSessionId?: string | null;
+  forkedAt?: number | null;
+  forkMode?: CoworkForkModeType;
   createdAt: number;
   updatedAt: number;
 }
@@ -533,7 +561,7 @@ CoworkConfig,
   | 'dreamingTimezone'
 >>;
 
-export type PluginSource = 'npm' | 'clawhub' | 'git' | 'local';
+export type PluginSource = 'npm' | 'clawhub' | 'git' | 'local' | 'openclaw';
 
 export interface UserInstalledPlugin {
   pluginId: string;
@@ -569,6 +597,28 @@ interface CoworkMessageRow {
   metadata: string | null;
   created_at: number;
   sequence: number | null;
+}
+
+interface CoworkForkSessionOptions {
+  sourceSessionId: string;
+  forkMode?: CoworkForkModeType;
+  forkedFromMessageId?: string | null;
+  title?: string;
+  cwdOverride?: string;
+  workspacePath?: string | null;
+  gitBranch?: string | null;
+  gitBaseRef?: string | null;
+  contextMessages?: CoworkForkContextMessage[];
+}
+
+export interface CoworkForkContextMessage {
+  content: string;
+  metadata: CoworkMessageMetadata;
+}
+
+interface CoworkForkBoundary {
+  sequence: number | null;
+  createdAt: number;
 }
 
 interface CoworkUserMemoryRow {
@@ -658,6 +708,13 @@ export class CoworkStore {
       messages: [],
       messagesOffset: 0,
       totalMessages: 0,
+      parentSessionId: null,
+      forkedFromMessageId: null,
+      forkedAt: null,
+      forkMode: CoworkForkMode.None,
+      forkWorkspacePath: null,
+      forkGitBranch: null,
+      forkGitBaseRef: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -725,9 +782,296 @@ export class CoworkStore {
       messages,
       messagesOffset: messageOffset,
       totalMessages,
+      ...this.getSessionForkMetadata(row.id),
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
+  }
+
+  private getSessionForkMetadata(id: string): Pick<
+    CoworkSession,
+    | 'parentSessionId'
+    | 'forkedFromMessageId'
+    | 'forkedAt'
+    | 'forkMode'
+    | 'forkWorkspacePath'
+    | 'forkGitBranch'
+    | 'forkGitBaseRef'
+  > {
+    try {
+      const row = this.db
+        .prepare(
+          `
+          SELECT parent_session_id, forked_from_message_id, forked_at, fork_mode,
+                 fork_workspace_path, fork_git_branch, fork_git_base_ref
+          FROM cowork_sessions
+          WHERE id = ?
+        `,
+        )
+        .get(id) as
+        | {
+            parent_session_id?: string | null;
+            forked_from_message_id?: string | null;
+            forked_at?: number | null;
+            fork_mode?: string | null;
+            fork_workspace_path?: string | null;
+            fork_git_branch?: string | null;
+            fork_git_base_ref?: string | null;
+          }
+        | undefined;
+
+      return {
+        parentSessionId: row?.parent_session_id ?? null,
+        forkedFromMessageId: row?.forked_from_message_id ?? null,
+        forkedAt: row?.forked_at ?? null,
+        forkMode: (row?.fork_mode as CoworkForkModeType | undefined) ?? CoworkForkMode.None,
+        forkWorkspacePath: row?.fork_workspace_path ?? null,
+        forkGitBranch: row?.fork_git_branch ?? null,
+        forkGitBaseRef: row?.fork_git_base_ref ?? null,
+      };
+    } catch {
+      return {
+        parentSessionId: null,
+        forkedFromMessageId: null,
+        forkedAt: null,
+        forkMode: CoworkForkMode.None,
+        forkWorkspacePath: null,
+        forkGitBranch: null,
+        forkGitBaseRef: null,
+      };
+    }
+  }
+
+  forkSession(options: CoworkForkSessionOptions): CoworkSession {
+    const source = this.getSession(options.sourceSessionId, 0);
+    if (!source) {
+      throw new Error(`Session ${options.sourceSessionId} not found`);
+    }
+    if (source.status === 'running') {
+      throw new Error('Cannot fork a running session.');
+    }
+
+    const forkMode = options.forkMode ?? CoworkForkMode.Conversation;
+    const id = uuidv4();
+    const now = Date.now();
+    const title = options.title?.trim() || `${source.title} (fork)`;
+    const cwd = options.cwdOverride ?? source.cwd;
+    const forkedFromMessageId = options.forkedFromMessageId?.trim() || null;
+    const forkBoundary = forkedFromMessageId
+      ? this.getMessageForkBoundary(options.sourceSessionId, forkedFromMessageId)
+      : null;
+    const messageLimitSequence = forkBoundary?.sequence ?? null;
+
+    if (forkedFromMessageId && (!forkBoundary || forkBoundary.sequence == null)) {
+      throw new Error(`Message ${forkedFromMessageId} not found in session ${options.sourceSessionId}`);
+    }
+
+    const sourceMessages = this.getForkSourceMessages(options.sourceSessionId, messageLimitSequence);
+    const forkedMessageIds = new Map(sourceMessages.map(row => [row.id, uuidv4()]));
+    const contextMessages = this.getForkContextMessages(
+      options.sourceSessionId,
+      options.contextMessages ?? [],
+      forkBoundary,
+    );
+    const insertSession = this.db.prepare(
+      `
+      INSERT INTO cowork_sessions (
+        id, title, claude_session_id, status, cwd, system_prompt, model_override,
+        execution_mode, active_skill_ids, agent_id, pinned, pin_order,
+        parent_session_id, forked_from_message_id, forked_at, fork_mode,
+        fork_workspace_path, fork_git_branch, fork_git_base_ref,
+        created_at, updated_at
+      )
+      VALUES (?, ?, NULL, 'idle', ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+    );
+    const insertMessage = this.db.prepare(
+      `
+      INSERT INTO cowork_messages (id, session_id, type, content, metadata, created_at, sequence)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `,
+    );
+
+    this.db.transaction(() => {
+      insertSession.run(
+        id,
+        title,
+        cwd,
+        source.systemPrompt,
+        source.modelOverride,
+        source.executionMode,
+        JSON.stringify(source.activeSkillIds),
+        source.agentId,
+        source.id,
+        forkedFromMessageId,
+        now,
+        forkMode,
+        options.workspacePath ?? null,
+        options.gitBranch ?? null,
+        options.gitBaseRef ?? null,
+        now,
+        now,
+      );
+
+      for (const contextMessage of contextMessages) {
+        const content = contextMessage.content.trim();
+        if (!content) continue;
+        insertMessage.run(
+          uuidv4(),
+          id,
+          'system',
+          content,
+          JSON.stringify({
+            hidden: true,
+            ...contextMessage.metadata,
+            kind: contextMessage.metadata.kind ?? CoworkSystemMessageKind.ForkCompactionSummary,
+          }),
+          now,
+          null,
+        );
+      }
+
+      for (const row of sourceMessages) {
+        insertMessage.run(
+          forkedMessageIds.get(row.id) ?? uuidv4(),
+          id,
+          row.type,
+          row.content,
+          this.sanitizeForkMessageMetadata(row.metadata, forkedMessageIds),
+          row.created_at,
+          row.sequence,
+        );
+      }
+    })();
+
+    const forked = this.getSession(id);
+    if (!forked) {
+      throw new Error(`Forked session ${id} could not be loaded`);
+    }
+    return forked;
+  }
+
+  private getMessageForkBoundary(sessionId: string, messageId: string): CoworkForkBoundary | null {
+    const row = this.db
+      .prepare('SELECT sequence, created_at FROM cowork_messages WHERE session_id = ? AND id = ?')
+      .get(sessionId, messageId) as { sequence?: number | null; created_at?: number } | undefined;
+    if (!row || typeof row.created_at !== 'number') return null;
+    return {
+      sequence: row.sequence ?? null,
+      createdAt: row.created_at,
+    };
+  }
+
+  getMessageTimestamp(sessionId: string, messageId: string): number | null {
+    return this.getMessageForkBoundary(sessionId, messageId)?.createdAt ?? null;
+  }
+
+  private shouldCopyForkContextMessage(
+    message: CoworkForkContextMessage,
+    forkBoundary: CoworkForkBoundary | null,
+  ): boolean {
+    if (!forkBoundary) return true;
+    const checkpointCreatedAt = message.metadata.checkpointCreatedAt;
+    return typeof checkpointCreatedAt === 'number' && checkpointCreatedAt <= forkBoundary.createdAt;
+  }
+
+  private getForkContextMessages(
+    sourceSessionId: string,
+    providedMessages: CoworkForkContextMessage[],
+    forkBoundary: CoworkForkBoundary | null,
+  ): CoworkForkContextMessage[] {
+    const provided = providedMessages.find((message) => (
+      message.content.trim() && this.shouldCopyForkContextMessage(message, forkBoundary)
+    ));
+    if (provided) return [provided];
+
+    const rows = this.getAll<CoworkMessageRow>(
+      `
+      SELECT id, type, content, metadata, created_at, sequence
+      FROM cowork_messages
+      WHERE session_id = ? AND type = 'system'
+      ORDER BY created_at DESC, ROWID DESC
+    `,
+      [sourceSessionId],
+    );
+
+    for (const row of rows) {
+      if (!row.metadata || !row.content.trim()) continue;
+      try {
+        const metadata = JSON.parse(row.metadata) as CoworkMessageMetadata;
+        if (metadata.kind !== CoworkSystemMessageKind.ForkCompactionSummary) continue;
+        const inherited = { content: row.content, metadata };
+        if (this.shouldCopyForkContextMessage(inherited, forkBoundary)) {
+          return [inherited];
+        }
+      } catch {
+        // Ignore malformed hidden context metadata and continue copying visible history.
+      }
+    }
+    return [];
+  }
+
+  private getForkSourceMessages(sessionId: string, maxSequence: number | null): CoworkMessageRow[] {
+    const where = maxSequence == null ? '' : 'AND sequence <= ?';
+    const params: (string | number)[] = maxSequence == null ? [sessionId] : [sessionId, maxSequence];
+    const rows = this.getAll<CoworkMessageRow>(
+      `
+      SELECT id, type, content, metadata, created_at, sequence
+      FROM cowork_messages
+      WHERE session_id = ? ${where}
+      ORDER BY COALESCE(sequence, created_at) ASC, created_at ASC, ROWID ASC
+    `,
+      params,
+    );
+
+    return rows.filter((row) => this.shouldCopyForkMessage(row));
+  }
+
+  private shouldCopyForkMessage(row: CoworkMessageRow): boolean {
+    if (!row.metadata) return true;
+    try {
+      const metadata = JSON.parse(row.metadata) as CoworkMessageMetadata;
+      if (metadata.kind === CoworkSystemMessageKind.ForkCompactionSummary) {
+        return false;
+      }
+      return row.type !== 'assistant' || metadata.isStreaming !== true;
+    } catch {
+      return true;
+    }
+  }
+
+  private sanitizeForkMessageMetadata(
+    metadataJson: string | null,
+    forkedMessageIds: Map<string, string>,
+  ): string | null {
+    if (!metadataJson) return null;
+    try {
+      const metadata = JSON.parse(metadataJson) as CoworkMessageMetadata;
+      const sanitized: CoworkMessageMetadata = { ...metadata };
+      delete sanitized.isStreaming;
+      delete sanitized.toolUseId;
+      delete sanitized.mediaStatusDetails;
+      delete sanitized.pendingApproval;
+      delete sanitized.requestId;
+      delete sanitized.runId;
+      delete sanitized.turnToken;
+      delete sanitized.openClawRunId;
+      delete sanitized.openClawSessionKey;
+      if (Array.isArray(sanitized.selectedTextSnippets)) {
+        sanitized.selectedTextSnippets = sanitized.selectedTextSnippets.map(snippet => ({
+          ...snippet,
+          ...(snippet.sourceMessageId && (snippet.sourceType ?? snippet.sourceMessageType) === CoworkSelectedTextSource.AssistantMessage
+            ? {
+              sourceMessageId: forkedMessageIds.get(snippet.sourceMessageId) ?? snippet.sourceMessageId,
+              sourceId: forkedMessageIds.get(snippet.sourceMessageId) ?? snippet.sourceId,
+            }
+            : {}),
+        }));
+      }
+      return Object.keys(sanitized).length > 0 ? JSON.stringify(sanitized) : null;
+    } catch {
+      return null;
+    }
   }
 
   updateSession(
@@ -857,7 +1201,7 @@ export class CoworkStore {
         `
         SELECT MAX(pin_order) as max_pin_order
         FROM cowork_sessions
-        WHERE pinned = 1 AND COALESCE(agent_id, 'main') = ?
+        WHERE pinned = 1 AND COALESCE(NULLIF(TRIM(agent_id), ''), 'main') = ?
       `,
       )
       .get(agentId) as { max_pin_order?: number | null } | undefined;
@@ -871,7 +1215,7 @@ export class CoworkStore {
   countSessions(agentId?: string): number {
     if (agentId) {
       const row = this.db
-        .prepare('SELECT COUNT(*) as count FROM cowork_sessions WHERE agent_id = ?')
+        .prepare("SELECT COUNT(*) as count FROM cowork_sessions WHERE COALESCE(NULLIF(TRIM(agent_id), ''), 'main') = ?")
         .get(agentId) as { count: number } | undefined;
       return row?.count || 0;
     }
@@ -889,6 +1233,9 @@ export class CoworkStore {
       pinned: number | null;
       pin_order: number | null;
       agent_id: string | null;
+      parent_session_id?: string | null;
+      forked_at?: number | null;
+      fork_mode?: string | null;
       created_at: number;
       updated_at: number;
     }
@@ -897,9 +1244,11 @@ export class CoworkStore {
     if (agentId) {
       rows = this.getAll<SessionSummaryRow>(
         `
-        SELECT id, title, status, pinned, pin_order, agent_id, created_at, updated_at
+        SELECT id, title, status, pinned, pin_order, agent_id,
+               parent_session_id, forked_at, fork_mode,
+               created_at, updated_at
         FROM cowork_sessions
-        WHERE agent_id = ?
+        WHERE COALESCE(NULLIF(TRIM(agent_id), ''), 'main') = ?
         ORDER BY pinned DESC,
           CASE WHEN pinned = 1 THEN COALESCE(pin_order, updated_at, created_at) END ASC,
           CASE WHEN pinned = 0 THEN updated_at END DESC,
@@ -911,7 +1260,9 @@ export class CoworkStore {
     } else {
       rows = this.getAll<SessionSummaryRow>(
         `
-        SELECT id, title, status, pinned, pin_order, agent_id, created_at, updated_at
+        SELECT id, title, status, pinned, pin_order, agent_id,
+               parent_session_id, forked_at, fork_mode,
+               created_at, updated_at
         FROM cowork_sessions
         ORDER BY pinned DESC,
           CASE WHEN pinned = 1 THEN COALESCE(pin_order, updated_at, created_at) END ASC,
@@ -930,6 +1281,9 @@ export class CoworkStore {
       pinned: Boolean(row.pinned),
       pinOrder: row.pin_order ?? null,
       agentId: row.agent_id || 'main',
+      parentSessionId: row.parent_session_id ?? null,
+      forkedAt: row.forked_at ?? null,
+      forkMode: (row.fork_mode as CoworkForkModeType | undefined) ?? CoworkForkMode.None,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     }));

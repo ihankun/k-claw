@@ -1,24 +1,36 @@
-import React from 'react';
+import { FolderIcon } from '@heroicons/react/24/outline';
+import React, { useEffect, useMemo, useRef } from 'react';
 
+import { classifyErrorKey } from '../../../common/coworkErrorClassify';
 import { ContextCompactionStatus } from '../../../common/coworkSystemMessages';
 import { getScheduledReminderDisplayText } from '../../../scheduledTask/reminderText';
 import { i18nService } from '../../services/i18n';
 import type { Artifact } from '../../types/artifact';
 import type { CoworkMessage, CoworkMessageMetadata } from '../../types/cowork';
+import { revealLocalPathWithToast } from '../../utils/localFileActions';
 import { ArtifactPreviewCard } from '../artifacts';
 import ExclamationTriangleIcon from '../icons/ExclamationTriangleIcon';
 import InformationCircleIcon from '../icons/InformationCircleIcon';
+import MarkdownContent from '../MarkdownContent';
 import AssistantMessageItem from './AssistantMessageItem';
+import MediaPollingIndicator from './MediaPollingIndicator';
 import {
+  collectMediaPollCounts,
+  consolidateMediaPolling,
   type ConversationTurn,
   COWORK_DETAIL_CONTENT_CLASS,
   COWORK_DETAIL_GUTTER_CLASS,
   getContextCompactionMessageLabel,
+  getMediaCompletionDisplayText,
+  getRetainedMediaPollCount,
   getToolResultDisplay,
   getToolResultLineCount,
+  getToolResultLineCountSummary,
+  getVideoPathArtifacts,
   getVisibleAssistantItems,
   hasText,
   isContextCompactionMessage,
+  isDuplicateGeneratedVideoAssistantMessage,
 } from './messageDisplayUtils';
 import ThinkingBlock from './ThinkingBlock';
 import ToolCallGroup from './ToolCallGroup';
@@ -87,6 +99,69 @@ const TypingDots: React.FC = () => (
   </div>
 );
 
+const getSystemMessageDisplayContent = (message: CoworkMessage, content: string): string => {
+  const errorText = typeof message.metadata?.error === 'string' ? message.metadata.error : null;
+  if (!errorText) return content;
+
+  const key = classifyErrorKey(errorText) ?? classifyErrorKey(content);
+  return key ? i18nService.t(key) : content;
+};
+
+// ── VideoArtifactPathList ────────────────────────────────────────────────────
+
+const VideoArtifactPathList: React.FC<{ artifacts: Artifact[] }> = ({ artifacts }) => {
+  if (artifacts.length === 0) return null;
+
+  const getDisplayPath = (filePath: string): string => {
+    const lastSlash = filePath.lastIndexOf('/');
+    return lastSlash >= 0 ? filePath.slice(lastSlash + 1) : filePath;
+  };
+
+  return (
+    <div className="space-y-1">
+      {artifacts.map(artifact => (
+        <div
+          key={artifact.id}
+          className="flex items-center gap-2 text-xs text-secondary"
+        >
+          <span className="truncate">{getDisplayPath(artifact.filePath!)}</span>
+          <button
+            className="flex items-center gap-1 text-primary hover:underline flex-shrink-0"
+            onClick={() => void revealLocalPathWithToast(artifact.filePath!)}
+          >
+            <FolderIcon className="h-3.5 w-3.5" />
+            <span>{i18nService.t('showInFolder')}</span>
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// ── MediaImageInline ────────────────────────────────────────────────────────
+
+const MediaImageInline: React.FC<{ artifacts: Artifact[] }> = ({ artifacts }) => {
+  if (artifacts.length === 0) return null;
+  return (
+    <div className="flex flex-wrap gap-2">
+      {artifacts.map(artifact => {
+        const src = artifact.filePath
+          ? `localfile://${artifact.filePath}`
+          : artifact.content;
+        if (!src) return null;
+        return (
+          <img
+            key={artifact.id}
+            src={src}
+            alt={artifact.title || ''}
+            className="max-w-[320px] max-h-[240px] rounded-lg border border-border object-contain"
+          />
+        );
+      })}
+    </div>
+  );
+};
+
 // ── AssistantTurnBlock ───────────────────────────────────────────────────────
 
 const AssistantTurnBlock: React.FC<{
@@ -95,6 +170,8 @@ const AssistantTurnBlock: React.FC<{
   resolveLocalFilePath?: (href: string, text: string) => string | null;
   mapDisplayText?: (value: string) => string;
   onOpenLocalService?: (artifact: Artifact) => void;
+  onOpenHtmlFile?: (artifact: Artifact) => void;
+  onForkMessage?: (messageId: string) => void;
   showTypingIndicator?: boolean;
   showCopyButtons?: boolean;
 }> = ({
@@ -103,18 +180,48 @@ const AssistantTurnBlock: React.FC<{
   resolveLocalFilePath,
   mapDisplayText,
   onOpenLocalService,
+  onOpenHtmlFile,
+  onForkMessage,
   showTypingIndicator = false,
   showCopyButtons = true,
 }) => {
   const visibleAssistantItems = getVisibleAssistantItems(turn.assistantItems);
+  const consolidatedItems = useMemo(
+    () => consolidateMediaPolling(visibleAssistantItems),
+    [visibleAssistantItems],
+  );
+  const videoPathArtifacts = useMemo(
+    () => getVideoPathArtifacts(artifacts),
+    [artifacts],
+  );
+  const retainedMediaPollCountsRef = useRef<Map<string, number>>(new Map());
+  const currentMediaPollCounts = useMemo(
+    () => collectMediaPollCounts(consolidatedItems),
+    [consolidatedItems],
+  );
+  const retainedMediaPollCounts = useMemo(() => {
+    const next = new Map(retainedMediaPollCountsRef.current);
+    for (const [key, pollCount] of currentMediaPollCounts) {
+      next.set(key, Math.max(next.get(key) ?? 0, pollCount));
+    }
+    return next;
+  }, [currentMediaPollCounts]);
+
+  useEffect(() => {
+    retainedMediaPollCountsRef.current = retainedMediaPollCounts;
+  }, [retainedMediaPollCounts]);
 
   const renderSystemMessage = (message: CoworkMessage) => {
     const isError = !hasText(message.content) && typeof message.metadata?.error === 'string';
     const rawContent = hasText(message.content)
       ? message.content
       : (typeof message.metadata?.error === 'string' ? message.metadata.error : '');
+    if (getMediaCompletionDisplayText(message, rawContent)) {
+      return null;
+    }
     const normalizedContent = getScheduledReminderDisplayText(rawContent) ?? rawContent;
-    const content = mapDisplayText ? mapDisplayText(normalizedContent) : normalizedContent;
+    const displayContent = getSystemMessageDisplayContent(message, normalizedContent);
+    const content = mapDisplayText ? mapDisplayText(displayContent) : displayContent;
     if (!content.trim() && !isContextCompactionMessage(message)) return null;
 
     if (isContextCompactionMessage(message)) {
@@ -134,8 +241,11 @@ const AssistantTurnBlock: React.FC<{
             ? <ExclamationTriangleIcon className="h-4 w-4 text-secondary flex-shrink-0" />
             : <InformationCircleIcon className="h-4 w-4 text-secondary flex-shrink-0" />
           }
-          <div className="text-xs whitespace-pre-wrap text-secondary">
-            {content}
+          <div className="min-w-0 text-xs text-secondary">
+            <MarkdownContent
+              content={content}
+              className="!text-xs !leading-5 [&_a]:!text-primary [&_p]:!my-0 [&_p]:!text-secondary [&_p]:!leading-5"
+            />
           </div>
         </div>
       </div>
@@ -163,7 +273,7 @@ const AssistantTurnBlock: React.FC<{
             </div>
             {resultLineCount > 0 && (
               <div className="text-xs text-muted mt-0.5">
-                {resultLineCount} {resultLineCount === 1 ? 'line' : 'lines'} of output
+                {getToolResultLineCountSummary(resultLineCount)}
               </div>
             )}
             {resultLineCount === 0 && showNoDetailError && (
@@ -199,7 +309,26 @@ const AssistantTurnBlock: React.FC<{
       <div className={COWORK_DETAIL_CONTENT_CLASS}>
         <div className="flex items-start gap-3">
           <div className="flex-1 min-w-0 py-3 space-y-3">
-            {visibleAssistantItems.map((item, index) => {
+            {consolidatedItems.map((item, index) => {
+              if (item.type === 'media_polling_group') {
+                const nextItem = consolidatedItems[index + 1];
+                const isLastInSequence = !nextItem || (nextItem.type !== 'tool_group' && nextItem.type !== 'media_polling_group');
+                const retainedPollCount = getRetainedMediaPollCount(
+                  { taskId: item.group.taskId, upstreamTaskId: item.group.upstreamTaskId },
+                  retainedMediaPollCounts,
+                );
+                return (
+                  <MediaPollingIndicator
+                    key={`media-poll-${item.group.taskId}`}
+                    group={{
+                      ...item.group,
+                      pollCount: retainedPollCount ?? item.group.pollCount,
+                    }}
+                    isLastInSequence={isLastInSequence}
+                  />
+                );
+              }
+
               if (item.type === 'assistant') {
                 if (item.message.metadata?.isThinking) {
                   return (
@@ -210,9 +339,24 @@ const AssistantTurnBlock: React.FC<{
                     />
                   );
                 }
-                const hasToolGroupAfter = visibleAssistantItems
+
+                if (isDuplicateGeneratedVideoAssistantMessage(item.message, videoPathArtifacts)) {
+                  return null;
+                }
+
+                // Check if there are image artifacts for this message (inline MEDIA display)
+                const imageArtifacts = artifacts?.filter(a =>
+                  a.type === 'image' && a.messageId === item.message.id,
+                );
+                if (imageArtifacts && imageArtifacts.length > 0 && !item.message.content.replace(/\s*MEDIA\s*/gi, '').trim()) {
+                  return (
+                    <MediaImageInline key={item.message.id} artifacts={imageArtifacts} />
+                  );
+                }
+
+                const hasToolGroupAfter = consolidatedItems
                   .slice(index + 1)
-                  .some(laterItem => laterItem.type === 'tool_group');
+                  .some(laterItem => laterItem.type === 'tool_group' || laterItem.type === 'media_polling_group');
                 const isLastAssistant = showCopyButtons && !hasToolGroupAfter;
 
                 return (
@@ -222,20 +366,22 @@ const AssistantTurnBlock: React.FC<{
                     resolveLocalFilePath={resolveLocalFilePath}
                     mapDisplayText={mapDisplayText}
                     showCopyButton={isLastAssistant}
+                    onFork={isLastAssistant ? onForkMessage : undefined}
                     turnMetadata={isLastAssistant ? (item.message.metadata as CoworkMessageMetadata) : undefined}
                   />
                 );
               }
 
               if (item.type === 'tool_group') {
-                const nextItem = visibleAssistantItems[index + 1];
-                const isLastInSequence = !nextItem || nextItem.type !== 'tool_group';
+                const nextItem = consolidatedItems[index + 1];
+                const isLastInSequence = !nextItem || (nextItem.type !== 'tool_group' && nextItem.type !== 'media_polling_group');
                 return (
                   <ToolCallGroup
                     key={`tool-${item.group.toolUse.id}`}
                     group={item.group}
                     isLastInSequence={isLastInSequence}
                     mapDisplayText={mapDisplayText}
+                    retainedMediaPollCounts={retainedMediaPollCounts}
                   />
                 );
               }
@@ -260,14 +406,18 @@ const AssistantTurnBlock: React.FC<{
             })}
             {showTypingIndicator && <TypingDots />}
             {artifacts && artifacts.length > 0 && (
-              <div className="flex flex-wrap gap-2 pt-1">
-                {artifacts.map(artifact => (
-                  <ArtifactPreviewCard
-                    key={artifact.id}
-                    artifact={artifact}
-                    onOpenLocalService={onOpenLocalService}
-                  />
-                ))}
+              <div className="space-y-2 pt-1">
+                <VideoArtifactPathList artifacts={videoPathArtifacts} />
+                <div className="flex flex-wrap gap-2">
+                  {artifacts.map(artifact => (
+                    <ArtifactPreviewCard
+                      key={artifact.id}
+                      artifact={artifact}
+                      onOpenLocalService={onOpenLocalService}
+                      onOpenHtmlFile={onOpenHtmlFile}
+                    />
+                  ))}
+                </div>
               </div>
             )}
           </div>

@@ -1,9 +1,24 @@
+import type {
+  CoworkContextUsageFailureReason,
+  CoworkContextUsageSource,
+  CoworkForkMode,
+} from '../../shared/cowork/constants';
+import type {
+  CoworkImageAttachmentPayload,
+  CoworkImageAttachmentPreview,
+} from '../../shared/cowork/imageAttachments';
+import type { CoworkSelectedTextSnippet } from '../../shared/cowork/selectedText';
+import type {
+  KitReference,
+  ResolvedKitCapabilities,
+} from '../../shared/kit/constants';
+import type {
+  OpenClawEnginePhase as SharedOpenClawEnginePhase,
+  OpenClawGatewayRepairErrorCode,
+} from '../../shared/openclawEngine/constants';
+
 // Cowork image attachment for vision-capable models
-export interface CoworkImageAttachment {
-  name: string;
-  mimeType: string;
-  base64Data: string;
-}
+export type CoworkImageAttachment = CoworkImageAttachmentPayload;
 
 // Cowork session status
 export const CoworkSessionStatusValue = {
@@ -49,6 +64,11 @@ export interface CoworkMessageMetadata {
   isFinal?: boolean;
   isThinking?: boolean;
   skillIds?: string[];
+  kitIds?: string[];
+  kitReferences?: KitReference[];
+  resolvedKitCapabilities?: ResolvedKitCapabilities;
+  imageAttachments?: CoworkImageAttachment[];
+  imageAttachmentPreviews?: CoworkImageAttachmentPreview[];
   usage?: {
     inputTokens?: number;
     outputTokens?: number;
@@ -58,6 +78,7 @@ export interface CoworkMessageMetadata {
   contextPercent?: number;
   model?: string;
   agentName?: string;
+  selectedTextSnippets?: CoworkSelectedTextSnippet[];
   [key: string]: unknown;
 }
 
@@ -75,6 +96,18 @@ export interface CoworkContextUsage {
   model?: string;
   updatedAt: number;
 }
+
+export type CoworkContextUsageResult =
+  | {
+      success: true;
+      usage?: CoworkContextUsage | null;
+      source?: CoworkContextUsageSource;
+    }
+  | {
+      success: false;
+      error?: string;
+      reason?: CoworkContextUsageFailureReason;
+    };
 
 // Cowork message
 export interface CoworkMessage {
@@ -98,12 +131,20 @@ export interface CoworkSession {
   modelOverride: string;
   executionMode: CoworkExecutionMode;
   activeSkillIds: string[];
+  activeKitIds?: string[];
   agentId: string;
   messages: CoworkMessage[];
   /** Offset of the first loaded message in the full message history. 0 means loaded from the beginning. */
   messagesOffset: number;
   /** Total number of messages stored for this session. */
   totalMessages: number;
+  parentSessionId?: string | null;
+  forkedFromMessageId?: string | null;
+  forkedAt?: number | null;
+  forkMode?: CoworkForkMode;
+  forkWorkspacePath?: string | null;
+  forkGitBranch?: string | null;
+  forkGitBaseRef?: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -165,20 +206,26 @@ export interface CoworkApiConfig {
   apiType?: 'anthropic' | 'openai';
 }
 
-export type OpenClawEnginePhase =
-  | 'not_installed'
-  | 'installing'
-  | 'ready'
-  | 'starting'
-  | 'running'
-  | 'error';
+export type OpenClawEnginePhase = SharedOpenClawEnginePhase;
 
 export interface OpenClawEngineStatus {
   phase: OpenClawEnginePhase;
   version: string | null;
   progressPercent?: number;
   message?: string;
+  gatewayPort?: number | null;
+  gatewayHttpUrl?: string | null;
   canRetry: boolean;
+}
+
+export interface OpenClawGatewayRepairResult {
+  success: boolean;
+  status?: OpenClawEngineStatus;
+  originalPath?: string;
+  backupPath?: string;
+  error?: string;
+  errorCode?: OpenClawGatewayRepairErrorCode;
+  recoverable?: boolean;
 }
 
 export interface CoworkUserMemoryEntry {
@@ -232,8 +279,17 @@ export interface CoworkSessionSummary {
   pinned: boolean;
   pinOrder?: number | null;
   agentId?: string;
+  parentSessionId?: string | null;
+  forkedAt?: number | null;
+  forkMode?: CoworkForkMode;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface CoworkForkSessionOptions {
+  sessionId: string;
+  forkedFromMessageId?: string | null;
+  title?: string;
 }
 
 // Subagent session summary for sidebar display
@@ -255,9 +311,16 @@ export interface CoworkStartOptions {
   systemPrompt?: string;
   title?: string;
   activeSkillIds?: string[];
+  runtimeSkillIds?: string[];
+  kitIds?: string[];
+  kitReferences?: KitReference[];
+  resolvedKitCapabilities?: ResolvedKitCapabilities;
   agentId?: string;
   modelOverride?: string;
   imageAttachments?: CoworkImageAttachment[];
+  mediaSelection?: { mode: string; modelId?: string; modelName?: string; imageModelId?: string; videoModelId?: string };
+  mediaReferences?: import('./mediaGeneration').MediaAttachmentRef[];
+  selectedTextSnippets?: CoworkSelectedTextSnippet[];
 }
 
 // Continue session options
@@ -266,7 +329,14 @@ export interface CoworkContinueOptions {
   prompt: string;
   systemPrompt?: string;
   activeSkillIds?: string[];
+  runtimeSkillIds?: string[];
+  kitIds?: string[];
+  kitReferences?: KitReference[];
+  resolvedKitCapabilities?: ResolvedKitCapabilities;
   imageAttachments?: CoworkImageAttachment[];
+  mediaSelection?: { mode: string; modelId?: string; modelName?: string; imageModelId?: string; videoModelId?: string };
+  mediaReferences?: import('./mediaGeneration').MediaAttachmentRef[];
+  selectedTextSnippets?: CoworkSelectedTextSnippet[];
 }
 
 // IPC result types

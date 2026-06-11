@@ -1,7 +1,92 @@
+import { ProviderName } from '@shared/providers';
+
 import { store } from '../store';
-import { setAuthLoading, setLoggedIn, setLoggedOut, updateQuota, setProfileSummary } from '../store/slices/authSlice';
-import { setServerModels, clearServerModels } from '../store/slices/modelSlice';
+import {
+  setAuthLoading,
+  setLoggedIn,
+  setLoggedOut,
+  setProfileSummary,
+  updateQuota,
+  type UserProfile,
+  type UserQuota,
+} from '../store/slices/authSlice';
 import type { Model } from '../store/slices/modelSlice';
+import {
+  clearServerModels,
+  setServerModels,
+} from '../store/slices/modelSlice';
+
+interface AuthStateRefreshResult {
+  isLoggedIn: boolean;
+  user: UserProfile | null;
+  quota: UserQuota | null;
+}
+
+export interface PricingCatalogTextModel {
+  modelId?: string;
+  modelName?: string;
+  provider?: string;
+  providerLabel?: string;
+  description?: string;
+  supportsImage?: boolean;
+  supportsThinking?: boolean;
+  contextWindow?: number | null;
+  costMultiplier?: number;
+}
+
+export interface PricingCatalogResponse {
+  textModels?: PricingCatalogTextModel[];
+  imageModels?: unknown[];
+  videoModels?: unknown[];
+}
+
+const readString = (value: unknown): string => (
+  typeof value === 'string' ? value.trim() : ''
+);
+
+const readPositiveNumber = (value: unknown): number | undefined => (
+  typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? value
+    : undefined
+);
+
+export function mapPricingCatalogTextModelsToServerModels(
+  textModels: PricingCatalogTextModel[],
+): Model[] {
+  return textModels.flatMap((model): Model[] => {
+    const modelId = readString(model.modelId);
+    if (!modelId) return [];
+
+    const modelName = readString(model.modelName) || modelId;
+    const provider = readString(model.providerLabel)
+      || readString(model.provider)
+      || 'LobsterAI';
+    const contextWindow = readPositiveNumber(model.contextWindow);
+    const costMultiplier = readPositiveNumber(model.costMultiplier);
+
+    return [{
+      id: modelId,
+      name: modelName,
+      provider,
+      providerKey: ProviderName.LobsteraiServer,
+      isServerModel: true,
+      supportsImage: model.supportsImage === true,
+      supportsThinking: model.supportsThinking === true,
+      description: readString(model.description) || undefined,
+      costMultiplier,
+      contextWindow,
+      accessible: false,
+    }];
+  });
+}
+
+export function mapPricingCatalogToPublicServerModels(
+  catalog: PricingCatalogResponse,
+): Model[] {
+  return mapPricingCatalogTextModelsToServerModels(
+    Array.isArray(catalog.textModels) ? catalog.textModels : [],
+  );
+}
 
 class AuthService {
   private unsubCallback: (() => void) | null = null;
@@ -17,22 +102,26 @@ class AuthService {
     this.destroy();
 
     store.dispatch(setAuthLoading(true));
-    try {
-      const result = await window.electron.auth.getUser();
-      if (result.success && result.user) {
-        store.dispatch(setLoggedIn({ user: result.user, quota: result.quota }));
-        await this.loadServerModels();
-      } else {
-        store.dispatch(setLoggedOut());
-      }
-    } catch {
-      store.dispatch(setLoggedOut());
-    }
 
     // Listen for OAuth callback from protocol handler
     this.unsubCallback = window.electron.auth.onCallback(async ({ code }) => {
       await this.handleCallback(code);
     });
+
+    try {
+      const pendingCode = await window.electron.auth.getPendingCallback();
+      let handledPendingCode = false;
+      if (pendingCode) {
+        handledPendingCode = await this.handleCallback(pendingCode);
+      }
+      if (!handledPendingCode) {
+        await this.refreshAuthState({ clearOnFailure: true });
+      }
+    } catch {
+      store.dispatch(setLoggedOut());
+      store.dispatch(clearServerModels());
+      await this.loadPublicPricingCatalogModels();
+    }
 
     // Listen for quota changes (e.g. after cowork session using server model)
     this.unsubQuotaChanged = window.electron.auth.onQuotaChanged(() => {
@@ -76,6 +165,7 @@ class AuthService {
       if (response.ok && typeof response.data === 'object' && response.data !== null) {
         const value = (response.data as any)?.data?.value;
         if (typeof value === 'string' && value.trim()) {
+          console.log('[Auth] fetched login URL from overmind');
           return value.trim();
         }
       }
@@ -84,22 +174,57 @@ class AuthService {
     }
     // Fallback: use Portal login page directly
     const { getPortalLoginUrl } = await import('./endpoints');
+    console.log('[Auth] using fallback portal login URL');
     return getPortalLoginUrl();
   }
 
   /**
    * Handle OAuth callback with auth code.
    */
-  async handleCallback(code: string) {
+  async handleCallback(code: string): Promise<boolean> {
     try {
       const result = await window.electron.auth.exchange(code);
       if (result.success) {
         store.dispatch(setLoggedIn({ user: result.user, quota: result.quota }));
         await this.loadServerModels();
+        this.refreshQuota();
+        return true;
       }
     } catch (e) {
       console.error('Auth callback failed:', e);
     }
+    return false;
+  }
+
+  /**
+   * Refresh the full auth snapshot from persisted tokens.
+   */
+  async refreshAuthState(
+    options: { clearOnFailure?: boolean } = {},
+  ): Promise<AuthStateRefreshResult> {
+    try {
+      const result = await window.electron.auth.getUser();
+      if (result.success && result.user) {
+        store.dispatch(setLoggedIn({ user: result.user, quota: result.quota }));
+        await this.loadServerModels();
+        return { isLoggedIn: true, user: result.user, quota: result.quota ?? null };
+      }
+    } catch {
+      // handled below
+    }
+
+    if (options.clearOnFailure) {
+      store.dispatch(setLoggedOut());
+      store.dispatch(clearServerModels());
+      await this.loadPublicPricingCatalogModels();
+    }
+
+    const current = store.getState().auth;
+    return {
+      isLoggedIn: current.isLoggedIn,
+      user: current.user,
+      quota: current.quota,
+    };
   }
 
   /**
@@ -109,6 +234,7 @@ class AuthService {
     await window.electron.auth.logout();
     store.dispatch(setLoggedOut());
     store.dispatch(clearServerModels());
+    await this.loadPublicPricingCatalogModels();
   }
 
   /**
@@ -166,7 +292,7 @@ class AuthService {
     try {
       const modelsResult = await window.electron.auth.getModels();
       if (modelsResult.success && modelsResult.models) {
-        const serverModels: Model[] = modelsResult.models.map((m: { modelId: string; modelName: string; provider: string; apiFormat: string; supportsImage?: boolean }) => ({
+        const serverModels: Model[] = modelsResult.models.map((m: { modelId: string; modelName: string; provider: string; apiFormat: string; supportsImage?: boolean; supportsThinking?: boolean; costMultiplier?: number; description?: string; accessible?: boolean; restrictionHint?: string }) => ({
           id: m.modelId,
           name: m.modelName,
           provider: m.provider,
@@ -174,11 +300,34 @@ class AuthService {
           isServerModel: true,
           serverApiFormat: m.apiFormat,
           supportsImage: m.supportsImage ?? false,
+          supportsThinking: m.supportsThinking ?? false,
+          description: m.description,
+          costMultiplier: m.costMultiplier,
+          accessible: m.accessible ?? true,
+          restrictionHint: m.restrictionHint ?? undefined,
         }));
         store.dispatch(setServerModels(serverModels));
       }
     } catch {
       // ignore — server models are optional
+    }
+  }
+
+  /**
+   * Load public pricing catalog models for unauthenticated read-only display.
+   */
+  private async loadPublicPricingCatalogModels() {
+    try {
+      const catalogResult = await window.electron.auth.getPricingCatalog();
+      if (!catalogResult.success || !catalogResult.textModels) {
+        return;
+      }
+      const serverModels = mapPricingCatalogToPublicServerModels({
+        textModels: catalogResult.textModels,
+      });
+      store.dispatch(setServerModels(serverModels));
+    } catch {
+      // ignore — public catalog is optional
     }
   }
 }

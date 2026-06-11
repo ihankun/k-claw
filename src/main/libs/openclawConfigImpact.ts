@@ -1,3 +1,5 @@
+import { ProviderName } from '../../shared/providers';
+
 export const OpenClawConfigImpact = {
   None: 'none',
   Sync: 'sync',
@@ -21,6 +23,7 @@ export const OpenClawConfigImpactReason = {
   PluginUninstall: 'plugin.uninstall',
   PluginToggle: 'plugin.toggle',
   PluginConfig: 'plugin.config',
+  McpConfig: 'mcp.config',
 } as const;
 
 export type OpenClawConfigImpactReason =
@@ -156,6 +159,7 @@ export const removeImpactDecisionReasons = (
       || reason === OpenClawConfigImpactReason.PluginUninstall
       || reason === OpenClawConfigImpactReason.PluginToggle
       || reason === OpenClawConfigImpactReason.PluginConfig
+      || reason === OpenClawConfigImpactReason.McpConfig
     ) {
       return decision(OpenClawConfigImpact.Restart, reason);
     }
@@ -198,6 +202,9 @@ const providerSecretsOnly = (providers: unknown): unknown => {
 
   const secrets: JsonLikeObject = {};
   for (const [providerName, provider] of Object.entries(providers)) {
+    if (providerName === ProviderName.Copilot) {
+      continue;
+    }
     if (!isPlainObject(provider)) {
       continue;
     }
