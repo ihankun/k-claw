@@ -1,8 +1,8 @@
 import type { OpenClawSessionPatch } from '../../common/openclawSession';
 import type { AppUpdateCheckResult, AppUpdateRuntimeState } from '../../shared/appUpdate/constants';
 import type {
-  AsrRecognizeRequest,
-  AsrRecognizeResult,
+  AsrRealtimeSessionRequest,
+  AsrRealtimeSessionResult,
 } from '../../shared/asr/constants';
 import type {
   BrowserDiagnosticResult,
@@ -20,6 +20,8 @@ import type {
 import type {
   HtmlShareAccessMode,
   HtmlShareConfigurableStatus,
+  HtmlShareDisabledSource,
+  HtmlShareSourceType,
   HtmlShareStatus,
 } from '../../shared/htmlShare/constants';
 import type {
@@ -367,6 +369,8 @@ interface HtmlShareResult {
   contentUpdatedAt?: string;
   disabledAt?: string | null;
   disabledReason?: string | null;
+  disabledSource?: HtmlShareDisabledSource | null;
+  restoredByUpdate?: boolean;
   error?: string;
   code?: number;
   warnings?: string[];
@@ -662,7 +666,7 @@ interface IElectronAPI {
     remoteManaged: (
       sessionId: string,
     ) => Promise<{ success: boolean; remoteManaged: boolean; error?: string }>;
-    listSessions: (options?: { limit?: number; offset?: number; agentId?: string }) => Promise<{
+    listSessions: (options?: { limit?: number; offset?: number; agentId?: string; searchQuery?: string }) => Promise<{
       success: boolean;
       sessions?: CoworkSessionSummary[];
       hasMore?: boolean;
@@ -752,6 +756,7 @@ interface IElectronAPI {
         sessionKey: string | null;
         status: 'running' | 'done' | 'error';
         createdAt: number;
+        endedAt: number | null;
       }>;
       error?: string;
     }>;
@@ -892,6 +897,7 @@ interface IElectronAPI {
       artifactId: string;
       filePath: string;
       title: string;
+      accessMode?: HtmlShareAccessMode;
     }) => Promise<HtmlShareResult>;
     updateFromHtmlFile: (options: {
       shareId: string;
@@ -900,19 +906,54 @@ interface IElectronAPI {
       filePath: string;
       title: string;
       currentStatus?: HtmlShareStatus;
+      accessMode?: HtmlShareAccessMode;
     }) => Promise<HtmlShareResult>;
     getByHtmlFile: (options: {
       filePath: string;
+    }) => Promise<{ success: boolean; share?: HtmlShareResult | null; error?: string; code?: number }>;
+    createFromArtifactFile: (options: {
+      sourceType: HtmlShareSourceType;
+      sessionId: string;
+      artifactId: string;
+      title: string;
+      accessMode?: HtmlShareAccessMode;
+      fileName?: string;
+      filePath?: string;
+      content?: string;
+      remoteUrl?: string;
+    }) => Promise<HtmlShareResult>;
+    updateFromArtifactFile: (options: {
+      sourceType: HtmlShareSourceType;
+      shareId: string;
+      sessionId: string;
+      artifactId: string;
+      title: string;
+      accessMode?: HtmlShareAccessMode;
+      fileName?: string;
+      filePath?: string;
+      content?: string;
+      remoteUrl?: string;
+      currentStatus?: HtmlShareStatus;
+    }) => Promise<HtmlShareResult>;
+    getByArtifactFile: (options: {
+      sourceType: HtmlShareSourceType;
+      sessionId?: string;
+      artifactId?: string;
+      filePath?: string;
     }) => Promise<{ success: boolean; share?: HtmlShareResult | null; error?: string; code?: number }>;
     updateStatus: (options: {
       shareId: string;
       status: HtmlShareConfigurableStatus;
     }) => Promise<HtmlShareResult>;
+    updateAccessMode: (options: {
+      shareId: string;
+      accessMode: HtmlShareAccessMode;
+    }) => Promise<HtmlShareResult>;
     disable: (shareId: string) => Promise<HtmlShareResult>;
     get: (shareId: string) => Promise<{ success: boolean; share?: unknown; error?: string }>;
   };
   asr: {
-    recognize: (options: AsrRecognizeRequest) => Promise<AsrRecognizeResult>;
+    createRealtimeSession: (options: AsrRealtimeSessionRequest) => Promise<AsrRealtimeSessionResult>;
   };
   artifact: {
     watchFile: (filePath: string) => Promise<void>;
@@ -931,7 +972,7 @@ interface IElectronAPI {
   };
   autoLaunch: {
     get: () => Promise<{ enabled: boolean }>;
-    set: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
+    set: (enabled: boolean) => Promise<{ success: boolean; enabled?: boolean; error?: string; errorCode?: string }>;
   };
   preventSleep: {
     get: () => Promise<{ enabled: boolean }>;
@@ -1214,6 +1255,7 @@ interface IElectronAPI {
   scheduledTasks: {
     list: () => Promise<{
       success: boolean;
+      ready?: boolean;
       tasks?: import('../../scheduledTask/types').ScheduledTask[];
       error?: string;
     }>;
@@ -1264,6 +1306,7 @@ interface IElectronAPI {
       filter?: import('../../scheduledTask/types').RunFilter,
     ) => Promise<{
       success: boolean;
+      ready?: boolean;
       runs?: import('../../scheduledTask/types').ScheduledTaskRunWithName[];
       error?: string;
     }>;
@@ -1320,7 +1363,20 @@ interface IElectronAPI {
     getAccessToken: () => Promise<string | null>;
     getModels: () => Promise<{
       success: boolean;
-      models?: Array<{ modelId: string; modelName: string; provider: string; apiFormat: string }>;
+      models?: Array<{
+        modelId: string;
+        modelName: string;
+        provider: string;
+        apiFormat: string;
+        supportsImage?: boolean;
+        supportsThinking?: boolean;
+        contextWindow?: number;
+        explicitContextCache?: boolean;
+        costMultiplier?: number;
+        description?: string;
+        accessible?: boolean;
+        restrictionHint?: string;
+      }>;
     }>;
     getPricingCatalog: () => Promise<{
       success: boolean;

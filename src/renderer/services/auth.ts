@@ -292,7 +292,7 @@ class AuthService {
     try {
       const modelsResult = await window.electron.auth.getModels();
       if (modelsResult.success && modelsResult.models) {
-        const serverModels: Model[] = modelsResult.models.map((m: { modelId: string; modelName: string; provider: string; apiFormat: string; supportsImage?: boolean; supportsThinking?: boolean; costMultiplier?: number; description?: string; accessible?: boolean; restrictionHint?: string }) => ({
+        const serverModels: Model[] = modelsResult.models.map((m: { modelId: string; modelName: string; provider: string; apiFormat: string; supportsImage?: boolean; supportsThinking?: boolean; contextWindow?: number; explicitContextCache?: boolean; costMultiplier?: number; description?: string; accessible?: boolean; restrictionHint?: string }) => ({
           id: m.modelId,
           name: m.modelName,
           provider: m.provider,
@@ -301,15 +301,20 @@ class AuthService {
           serverApiFormat: m.apiFormat,
           supportsImage: m.supportsImage ?? false,
           supportsThinking: m.supportsThinking ?? false,
+          contextWindow: m.contextWindow,
+          explicitContextCache: m.explicitContextCache ?? false,
           description: m.description,
           costMultiplier: m.costMultiplier,
           accessible: m.accessible ?? true,
           restrictionHint: m.restrictionHint ?? undefined,
         }));
         store.dispatch(setServerModels(serverModels));
+        console.debug(`[Auth] loaded ${serverModels.length} server model(s) into renderer state`);
+      } else {
+        console.debug('[Auth] server model load returned no models');
       }
-    } catch {
-      // ignore — server models are optional
+    } catch (error) {
+      console.warn('[Auth] failed to load server models:', error);
     }
   }
 

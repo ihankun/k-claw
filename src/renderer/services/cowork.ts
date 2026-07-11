@@ -212,6 +212,12 @@ class CoworkService {
       if (metadata?.isFinal !== true && session?.status !== 'completed') {
         store.dispatch(updateSessionStatus({ sessionId, status: 'running' }));
       }
+      if (metadata?.isFinal === true && typeof metadata.model === 'string' && metadata.model.trim()) {
+        this.logDiagnostic(
+          'debug',
+          `received final message metadata for session ${sessionId}, message ${messageId}, model ${metadata.model}`,
+        );
+      }
       store.dispatch(updateMessageContent({ sessionId, messageId, content, metadata }));
     });
     this.streamListenerCleanups.push(messageUpdateCleanup);
@@ -614,9 +620,41 @@ class CoworkService {
     return result ?? { success: false, error: 'Cowork IPC is unavailable' };
   }
 
-  async listSessionsForSearch(limit: number, offset: number): Promise<CoworkSessionListResult> {
-    const result = await window.electron?.cowork?.listSessions({ limit, offset });
-    return result ?? { success: false, error: 'Cowork IPC is unavailable' };
+  async listSessionsForSearch(
+    limit: number,
+    offset: number,
+    searchQuery?: string,
+  ): Promise<CoworkSessionListResult> {
+    const trimmedQuery = searchQuery?.trim();
+    const startedAt = performance.now();
+    console.debug('[CoworkSearch] requesting task sessions for the search modal', {
+      hasQuery: !!trimmedQuery,
+      queryLength: trimmedQuery?.length ?? 0,
+      limit,
+      offset,
+    });
+
+    try {
+      const result = await window.electron?.cowork?.listSessions({
+        limit,
+        offset,
+        ...(trimmedQuery ? { searchQuery: trimmedQuery } : {}),
+      });
+      const resolved = result ?? { success: false, error: 'Cowork IPC is unavailable' };
+      console.debug('[CoworkSearch] task session request finished', {
+        success: resolved.success,
+        resultCount: resolved.sessions?.length ?? 0,
+        hasMore: resolved.hasMore ?? false,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return resolved;
+    } catch (error) {
+      console.warn('[CoworkSearch] task session request failed:', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to search sessions',
+      };
+    }
   }
 
   async loadMoreSessions(): Promise<boolean> {
@@ -780,14 +818,16 @@ class CoworkService {
     const cowork = window.electron?.cowork;
     if (!cowork) return false;
 
+    this.logDiagnostic('info', `stop requested for session ${sessionId}.`);
     const result = await cowork.stopSession(sessionId);
     if (result.success) {
       store.dispatch(setStreaming(false));
       store.dispatch(updateSessionStatus({ sessionId, status: 'idle' }));
+      this.logDiagnostic('info', `stop completed for session ${sessionId}.`);
       return true;
     }
 
-    console.error('Failed to stop session:', result.error);
+    this.logDiagnostic('warn', `stop failed for session ${sessionId}: ${result.error ?? 'Unknown error'}.`);
     return false;
   }
 
